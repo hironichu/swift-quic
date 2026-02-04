@@ -12,7 +12,7 @@
 /// ```
 
 import Foundation
-
+import Crypto
 /// TLS 1.3 ServerHello message
 public struct ServerHello: Sendable {
 
@@ -57,10 +57,8 @@ public struct ServerHello: Sendable {
         cipherSuite: CipherSuite,
         extensions: [TLSExtension]
     ) {
-        var random = Data(count: TLSConstants.randomLength)
-        random.withUnsafeMutableBytes { ptr in
-            _ = SecRandomCopyBytes(kSecRandomDefault, TLSConstants.randomLength, ptr.baseAddress!)
-        }
+        let key = SymmetricKey(size: .bits256)
+        let random = key.withUnsafeBytes { Data($0) }
         self.init(random: random, legacySessionIDEcho: legacySessionIDEcho, cipherSuite: cipherSuite, extensions: extensions)
     }
 

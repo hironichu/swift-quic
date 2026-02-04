@@ -33,10 +33,8 @@ public struct StatelessResetToken: Sendable, Hashable {
 
     /// Generates a new random stateless reset token
     public static func generate() -> StatelessResetToken {
-        var tokenData = Data(count: 16)
-        tokenData.withUnsafeMutableBytes { ptr in
-            _ = SecRandomCopyBytes(kSecRandomDefault, 16, ptr.baseAddress!)
-        }
+        // 16 bytes (128 bits) using Swift Crypto (cross-platform)
+        let tokenData = SymmetricKey(size: .bits128).withUnsafeBytes { Data($0) }
         // Force try is safe because we know the length is 16
         return try! StatelessResetToken(data: tokenData)
     }
@@ -88,10 +86,9 @@ public struct StatelessResetPacket: Sendable {
 
         // Random bytes = total size - 16 (token) - 1 (fixed bits byte)
         let randomSize = max(minimumSize - 16 - 1, 4)
-        var random = Data(count: randomSize)
-        random.withUnsafeMutableBytes { ptr in
-            _ = SecRandomCopyBytes(kSecRandomDefault, randomSize, ptr.baseAddress!)
-        }
+        // Generate random bytes using Swift Crypto (cross-platform)
+        let random = SymmetricKey(size: SymmetricKeySize(bitCount: randomSize * 8))
+            .withUnsafeBytes { Data($0) }
         self.randomBytes = random
     }
 

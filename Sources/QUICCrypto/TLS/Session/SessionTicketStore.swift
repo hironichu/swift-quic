@@ -108,8 +108,7 @@ public final class SessionTicketStore: Sendable {
         nonce ticketNonce: Data? = nil
     ) -> NewSessionTicket {
         // Generate random ticket ID
-        var ticketId = Data(count: 32)
-        _ = ticketId.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
+        let ticketId = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
 
         // Generate nonce if not provided
         let nonce = ticketNonce ?? generateNonce()
@@ -152,9 +151,8 @@ public final class SessionTicketStore: Sendable {
 
     /// Generate a random nonce for ticket
     private func generateNonce() -> Data {
-        var nonce = Data(count: 8)
-        _ = nonce.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 8, $0.baseAddress!) }
-        return nonce
+        // 8 bytes (64 bits) using Swift Crypto (cross-platform)
+        return SymmetricKey(size: SymmetricKeySize(bitCount: 64)).withUnsafeBytes { Data($0) }
     }
 
     /// Evict oldest sessions

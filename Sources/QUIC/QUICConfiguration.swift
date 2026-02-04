@@ -291,7 +291,7 @@ public struct QUICConfiguration: Sendable {
 // MARK: - Transport Parameters Extension
 
 extension TransportParameters {
-    /// Creates transport parameters from a configuration
+    /// Creates transport parameters from a configuration (client-side)
     public init(from config: QUICConfiguration, sourceConnectionID: ConnectionID) {
         self.init()
         self.maxIdleTimeout = UInt64(config.maxIdleTimeout.components.seconds * 1000)
@@ -306,5 +306,23 @@ extension TransportParameters {
         self.maxAckDelay = UInt64(config.maxAckDelay.components.seconds * 1000 +
                                    config.maxAckDelay.components.attoseconds / 1_000_000_000_000_000)
         self.initialSourceConnectionID = sourceConnectionID
+    }
+
+    /// Creates transport parameters from a configuration (server-side)
+    ///
+    /// RFC 9000 Section 18.2: A server MUST include original_destination_connection_id
+    /// transport parameter in its transport parameters.
+    ///
+    /// - Parameters:
+    ///   - config: QUIC configuration
+    ///   - sourceConnectionID: Server's source connection ID
+    ///   - originalDestinationConnectionID: The DCID from the client's first Initial packet
+    public init(
+        from config: QUICConfiguration,
+        sourceConnectionID: ConnectionID,
+        originalDestinationConnectionID: ConnectionID
+    ) {
+        self.init(from: config, sourceConnectionID: sourceConnectionID)
+        self.originalDestinationConnectionID = originalDestinationConnectionID
     }
 }
