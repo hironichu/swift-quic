@@ -1163,15 +1163,16 @@ extension ManagedConnection: QUICConnectionProtocol {
 
     public func sendDatagram(_ data: Data) async throws {
         // Check if datagrams are supported (negotiated with peer)
-        guard transportParameters.maxDatagramFrameSize > 0 else {
+        guard let peerParams = peerTransportParameters,
+              peerParams.maxDatagramFrameSize > 0 else {
             throw QUICError.datagramsNotSupported
         }
 
-        // Check size limit
-        guard UInt64(data.count) <= transportParameters.maxDatagramFrameSize else {
+        // Check size limit against peer's advertised maximum
+        guard UInt64(data.count) <= peerParams.maxDatagramFrameSize else {
             throw QUICError.datagramTooLarge(
                 size: data.count,
-                max: transportParameters.maxDatagramFrameSize
+                max: peerParams.maxDatagramFrameSize
             )
         }
 
