@@ -112,6 +112,14 @@ public enum QUICError: Error, Sendable {
     /// Data blocked
     case dataBlocked
 
+    // MARK: - Datagram Errors
+
+    /// Datagram is too large for the configured max_datagram_frame_size
+    case datagramTooLarge(size: Int, max: UInt64)
+
+    /// Datagrams are not supported (max_datagram_frame_size not negotiated)
+    case datagramsNotSupported
+
     // MARK: - Packet Errors
 
     /// Invalid packet format
@@ -197,6 +205,10 @@ extension QUICError: CustomStringConvertible {
             return "Flow control error"
         case .dataBlocked:
             return "Data blocked"
+        case .datagramTooLarge(let size, let max):
+            return "Datagram too large: \(size) bytes exceeds maximum \(max) bytes"
+        case .datagramsNotSupported:
+            return "Datagrams not supported (max_datagram_frame_size not negotiated)"
         case .invalidPacket(let msg):
             return "Invalid packet: \(msg)"
         case .decryptionFailed:
@@ -249,6 +261,8 @@ extension QUICError {
             return .streamLimitError
         case .flowControlError, .dataBlocked:
             return .flowControlError
+        case .datagramTooLarge, .datagramsNotSupported:
+            return .protocolViolation
         case .invalidPacket, .invalidFrame, .packetNumberError:
             return .frameEncodingError
         case .decryptionFailed:

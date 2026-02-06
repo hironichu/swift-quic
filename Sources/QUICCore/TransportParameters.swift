@@ -57,6 +57,11 @@ public struct TransportParameters: Sendable, Hashable {
     /// Retry source connection ID (server only, after Retry)
     public var retrySourceConnectionID: ConnectionID?
 
+    /// Maximum datagram frame size (RFC 9221)
+    /// - If 0 or nil, datagrams are not supported
+    /// - If present and non-zero, indicates maximum size of DATAGRAM frames
+    public var maxDatagramFrameSize: UInt64
+
     /// Creates transport parameters with default values
     public init() {
         self.originalDestinationConnectionID = nil
@@ -76,6 +81,7 @@ public struct TransportParameters: Sendable, Hashable {
         self.activeConnectionIDLimit = 2
         self.initialSourceConnectionID = nil
         self.retrySourceConnectionID = nil
+        self.maxDatagramFrameSize = 0  // Disabled by default
     }
 }
 
