@@ -102,6 +102,16 @@ public final class ManagedConnection: Sendable {
     }
     private let sessionTicketState: Mutex<SessionTicketState>
 
+    /// State for incoming datagram AsyncStream (lazy initialization pattern)
+    private struct IncomingDatagramState: Sendable {
+        var continuation: AsyncStream<Data>.Continuation?
+        var stream: AsyncStream<Data>?
+        var isShutdown: Bool = false
+        /// Buffer for datagrams that arrive before incomingDatagrams is accessed
+        var pendingDatagrams: [Data] = []
+    }
+    private let incomingDatagramState: Mutex<IncomingDatagramState>
+
     /// Original connection ID (for Initial key derivation)
     /// This is the DCID from the first client Initial packet
     private let originalConnectionID: ConnectionID
@@ -174,6 +184,7 @@ public final class ManagedConnection: Sendable {
         self.streamContinuationsState = Mutex(StreamContinuationsState())
         self.incomingStreamState = Mutex(IncomingStreamState())
         self.sessionTicketState = Mutex(SessionTicketState())
+        self.incomingDatagramState = Mutex(IncomingDatagramState())
 
         // Set TLS provider on handler
         handler.setTLSProvider(tlsProvider)
@@ -1106,6 +1117,68 @@ extension ManagedConnection: QUICConnectionProtocol {
         }
     }
 
+    public var incomingDatagrams: AsyncStream<Data> {
+        incomingDatagramState.withLock { state in
+            // If shutdown, return existing finished stream or create a finished one
+            if state.isShutdown {
+                if let existing = state.stream { return existing }
+                let (stream, continuation) = AsyncStream<Data>.makeStream()
+                continuation.finish()
+                state.stream = stream
+                return stream
+            }
+
+            // Return existing stream if already created
+            if let existing = state.stream { return existing }
+
+            // Create new stream
+            let (stream, continuation) = AsyncStream<Data>.makeStream()
+            state.stream = stream
+            state.continuation = continuation
+
+            // Drain any pending datagrams
+            for pendingDatagram in state.pendingDatagrams {
+                continuation.yield(pendingDatagram)
+            }
+            state.pendingDatagrams.removeAll()
+
+            return stream
+        }
+    }
+
+    /// Notifies that a datagram was received (internal helper)
+    private func notifyDatagramReceived(_ data: Data) {
+        incomingDatagramState.withLock { state in
+            guard !state.isShutdown else { return }
+
+            if let continuation = state.continuation {
+                // Stream is active, yield directly
+                continuation.yield(data)
+            } else {
+                // Buffer until incomingDatagrams is accessed
+                state.pendingDatagrams.append(data)
+            }
+        }
+    }
+
+    public func sendDatagram(_ data: Data) async throws {
+        // Check if datagrams are supported (negotiated with peer)
+        guard transportParameters.maxDatagramFrameSize > 0 else {
+            throw QUICError.datagramsNotSupported
+        }
+
+        // Check size limit
+        guard UInt64(data.count) <= transportParameters.maxDatagramFrameSize else {
+            throw QUICError.datagramTooLarge(
+                size: data.count,
+                max: transportParameters.maxDatagramFrameSize
+            )
+        }
+
+        // Queue datagram frame for sending
+        handler.queueFrame(.datagram(DatagramFrame(data: data, hasLength: true)), level: .application)
+    }
+
     /// Notifies that a session ticket was received (internal helper)
     private func notifySessionTicketReceived(_ ticketInfo: NewSessionTicketInfo) {
         sessionTicketState.withLock { state in
@@ -1160,6 +1233,15 @@ extension ManagedConnection: QUICConnectionProtocol {
             state.continuation?.finish()
             state.continuation = nil
             state.pendingTickets.removeAll()
+        }
+
+        // Finish incoming datagram stream and mark as shutdown
+        incomingDatagramState.withLock { state in
+            guard !state.isShutdown else { return }  // Already shutdown
+            state.isShutdown = true
+            state.continuation?.finish()
+            state.continuation = nil
+            state.pendingDatagrams.removeAll()
         }
 
         // Resume any waiting stream readers with connection closed error
