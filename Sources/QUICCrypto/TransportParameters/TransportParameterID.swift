@@ -57,6 +57,9 @@ public enum TransportParameterID: UInt64, Sendable, CaseIterable {
     /// Retry source connection ID (0x10)
     case retrySourceConnectionID = 0x10
 
+    /// Max datagram frame size (0x20) - RFC 9221
+    case maxDatagramFrameSize = 0x20
+
     /// Whether this parameter is only valid for the server to send
     public var serverOnly: Bool {
         switch self {
@@ -94,6 +97,7 @@ public enum TransportParameterID: UInt64, Sendable, CaseIterable {
         case .ackDelayExponent: return 3
         case .maxAckDelay: return 25
         case .activeConnectionIDLimit: return 2
+        case .maxDatagramFrameSize: return 0  // 0 means datagrams not supported
         default: return nil
         }
     }

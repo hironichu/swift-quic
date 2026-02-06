@@ -43,6 +43,35 @@ public protocol QUICConnectionProtocol: Sendable {
     /// ```
     var incomingStreams: AsyncStream<any QUICStreamProtocol> { get }
 
+    /// Stream of incoming datagrams from the remote peer.
+    ///
+    /// Use this to receive unreliable datagrams sent by the remote peer.
+    /// Only available when `maxDatagramFrameSize` is configured.
+    ///
+    /// ## Usage
+    /// ```swift
+    /// // Process all incoming datagrams
+    /// for await datagram in connection.incomingDatagrams {
+    ///     processDatagram(datagram)
+    /// }
+    /// ```
+    var incomingDatagrams: AsyncStream<Data> { get }
+
+    /// Sends an unreliable datagram to the remote peer.
+    ///
+    /// Datagrams provide unreliable, unordered delivery of application data.
+    /// This is required for WebTransport support.
+    ///
+    /// - Parameter data: The datagram payload to send
+    /// - Throws: `QUICError.datagramTooLarge` if data exceeds max_datagram_frame_size
+    /// - Throws: `QUICError.datagramsNotSupported` if datagrams are not enabled
+    ///
+    /// ## Example
+    /// ```swift
+    /// try await connection.sendDatagram(Data("unreliable message".utf8))
+    /// ```
+    func sendDatagram(_ data: Data) async throws
+
     /// Closes the connection
     /// - Parameter error: Optional error code to send to peer
     func close(error: UInt64?) async

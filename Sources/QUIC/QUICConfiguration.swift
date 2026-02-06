@@ -127,6 +127,18 @@ public struct QUICConfiguration: Sendable {
     /// Application Layer Protocol Negotiation protocols
     public var alpn: [String]
 
+    // MARK: - Datagram Support (RFC 9221, WebTransport)
+
+    /// Maximum datagram frame size (default: 0 = disabled)
+    ///
+    /// When set to a non-zero value, enables support for unreliable DATAGRAM frames.
+    /// This is required for WebTransport protocol support.
+    ///
+    /// - RFC 9221: An Unreliable Datagram Extension to QUIC
+    /// - Recommended value: 1200 for WebTransport compatibility
+    /// - Setting to 0 disables datagram support
+    public var maxDatagramFrameSize: UInt64
+
     // MARK: - TLS
 
     /// Path to certificate file (for servers)
@@ -186,6 +198,7 @@ public struct QUICConfiguration: Sendable {
         self.connectionIDLength = 8
         self.version = .v1
         self.alpn = ["h3"]
+        self.maxDatagramFrameSize = 0  // Disabled by default
         self.certificatePath = nil
         self.privateKeyPath = nil
         self.verifyPeer = true
@@ -197,6 +210,28 @@ public struct QUICConfiguration: Sendable {
     public static func libp2p() -> QUICConfiguration {
         var config = QUICConfiguration()
         config.alpn = ["libp2p"]
+        return config
+    }
+
+    /// Creates a configuration for WebTransport
+    ///
+    /// WebTransport is a protocol framework built on QUIC and HTTP/3
+    /// for client-server communication from web browsers.
+    /// It requires datagram support for unreliable messaging.
+    ///
+    /// - Parameter maxDatagramFrameSize: Maximum datagram frame size (default: 1200)
+    /// - Returns: A configuration suitable for WebTransport
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// let config = QUICConfiguration.webTransport()
+    /// // Use this config with HTTP/3 for WebTransport
+    /// ```
+    public static func webTransport(maxDatagramFrameSize: UInt64 = 1200) -> QUICConfiguration {
+        var config = QUICConfiguration()
+        config.alpn = ["h3"]
+        config.maxDatagramFrameSize = maxDatagramFrameSize
         return config
     }
 
@@ -306,6 +341,7 @@ extension TransportParameters {
         self.maxAckDelay = UInt64(config.maxAckDelay.components.seconds * 1000 +
                                    config.maxAckDelay.components.attoseconds / 1_000_000_000_000_000)
         self.initialSourceConnectionID = sourceConnectionID
+        self.maxDatagramFrameSize = config.maxDatagramFrameSize
     }
 
     /// Creates transport parameters from a configuration (server-side)

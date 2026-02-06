@@ -1,6 +1,6 @@
 # swift-quic
 
-A pure Swift implementation of the QUIC transport protocol (RFC 9000, 9001, 9002).
+A pure Swift implementation of the QUIC transport protocol (RFC 9000, 9001, 9002, 9221).
 
 ## Overview
 
@@ -9,6 +9,8 @@ swift-quic provides a modern, type-safe QUIC implementation designed for the swi
 ## Features
 
 - **RFC 9000/9001/9002 Compliant**: Full QUIC transport protocol implementation
+- **RFC 9221 Datagram Support**: Unreliable datagram extension for WebTransport
+- **WebTransport Ready**: Full support for WebTransport protocol over QUIC
 - **TLS 1.3 Integration**: Native TLS 1.3 handshake with certificate validation (via [swift-certificates](https://github.com/apple/swift-certificates))
 - **0-RTT Support**: Early data transmission with session resumption
 - **Connection Migration**: PATH_CHALLENGE/RESPONSE with address validation
@@ -198,6 +200,76 @@ let response = try await stream.read()
 // Graceful shutdown
 await connection.shutdown()
 ```
+
+### WebTransport Support
+
+WebTransport is a protocol framework that provides low-latency, bidirectional client-server messaging. swift-quic provides full support for WebTransport's QUIC requirements, including unreliable datagrams.
+
+#### Configuring for WebTransport
+
+```swift
+import QUIC
+
+// Create a WebTransport-ready configuration
+let config = QUICConfiguration.webTransport(maxDatagramFrameSize: 1200)
+
+// Or configure manually
+var config = QUICConfiguration()
+config.maxDatagramFrameSize = 1200  // Enable datagrams
+config.alpn = ["h3"]  // HTTP/3 for WebTransport
+```
+
+#### Using Datagrams
+
+```swift
+// Server: Accept connection with datagram support
+let endpoint = QUICEndpoint(role: .server)
+var config = QUICConfiguration.webTransport()
+// ... configure TLS ...
+try await endpoint.start(address: SocketAddress(ipAddress: "0.0.0.0", port: 4433))
+
+for try await connection in endpoint.incomingConnections {
+    Task {
+        // Handle incoming datagrams
+        for await datagram in connection.incomingDatagrams {
+            print("Received datagram: \(datagram.count) bytes")
+            // Echo back
+            try? await connection.sendDatagram(datagram)
+        }
+    }
+}
+
+// Client: Send unreliable datagrams
+let client = QUICEndpoint(role: .client)
+let connection = try await client.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 4433))
+
+// Send unreliable message
+let message = Data("Hello WebTransport!".utf8)
+try await connection.sendDatagram(message)
+
+// Receive datagrams
+for await datagram in connection.incomingDatagrams {
+    print("Got response: \(String(data: datagram, encoding: .utf8) ?? "")")
+}
+```
+
+#### WebTransport Features
+
+- **Unreliable Datagrams**: Low-latency message delivery without retransmission
+- **Multiplexed Streams**: Reliable, ordered streams alongside datagrams
+- **Flow Control**: Automatic congestion control and flow management
+- **Size Limits**: Configurable maximum datagram size (default: 1200 bytes)
+
+#### Protocol Compliance
+
+swift-quic implements the WebTransport requirements:
+- **RFC 9221**: An Unreliable Datagram Extension to QUIC
+- **draft-ietf-webtrans-http3**: WebTransport over HTTP/3 (QUIC layer support)
+- DATAGRAM frames with length encoding
+- `max_datagram_frame_size` transport parameter negotiation
+- Automatic size validation and error handling
+
+Note: For full WebTransport support, you'll need an HTTP/3 layer on top of this QUIC implementation. swift-quic provides the necessary QUIC transport primitives (datagrams, streams, flow control) required by WebTransport.
 
 ### Frame Encoding/Decoding
 
@@ -443,6 +515,11 @@ swift test --filter QUICBenchmarks     # Benchmarks
   - Priority-based stream scheduling
   - Fair queuing within same priority level (round-robin)
   - Mutable stream priorities
+- **RFC 9221**: Unreliable Datagram Extension
+  - DATAGRAM frames (types 0x30, 0x31)
+  - `max_datagram_frame_size` transport parameter
+  - Size validation and error handling
+  - WebTransport QUIC layer support
 - **RFC 9002 Section 6**: Loss Detection
   - Packet and time threshold based detection
   - PTO (Probe Timeout) calculation
@@ -528,6 +605,9 @@ swift test --filter QUICBenchmarks     # Benchmarks
 - [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001.html) - Using TLS to Secure QUIC
 - [RFC 9002](https://www.rfc-editor.org/rfc/rfc9002.html) - QUIC Loss Detection and Congestion Control
 - [RFC 9218](https://www.rfc-editor.org/rfc/rfc9218.html) - Extensible Prioritization Scheme for HTTP
+- [RFC 9221](https://www.rfc-editor.org/rfc/rfc9221.html) - An Unreliable Datagram Extension to QUIC
+- [draft-ietf-webtrans-http3](https://datatracker.ietf.org/doc/draft-ietf-webtrans-http3/) - WebTransport over HTTP/3
+- [W3C WebTransport](https://www.w3.org/TR/webtransport/) - WebTransport API Specification
 
 ## License
 
