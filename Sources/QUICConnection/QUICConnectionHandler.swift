@@ -460,6 +460,13 @@ public final class QUICConnectionHandler: Sendable {
         )
     }
 
+    /// Gets peer transport parameters (if set)
+    ///
+    /// - Returns: Peer's transport parameters, or nil if not yet received
+    public func getPeerTransportParameters() -> TransportParameters? {
+        return peerTransportParams.withLock { $0 }
+    }
+
     // MARK: - Key Management
 
     /// Installs keys for an encryption level
