@@ -113,6 +113,9 @@ public final class QUICConnectionHandler: Sendable {
         self.cryptoStreamManager = CryptoStreamManager()
 
         // Initialize stream manager with transport parameters
+        // Note: Peer limits default to our local limits until peer's transport parameters arrive.
+        // This allows streams to be opened during handshake (e.g., for 0-RTT or early data).
+        // These will be updated to actual peer limits in setPeerTransportParameters().
         self.streamManager = StreamManager(
             isClient: role == .client,
             initialMaxData: transportParameters.initialMaxData,
@@ -120,7 +123,13 @@ public final class QUICConnectionHandler: Sendable {
             initialMaxStreamDataBidiRemote: transportParameters.initialMaxStreamDataBidiRemote,
             initialMaxStreamDataUni: transportParameters.initialMaxStreamDataUni,
             initialMaxStreamsBidi: transportParameters.initialMaxStreamsBidi,
-            initialMaxStreamsUni: transportParameters.initialMaxStreamsUni
+            initialMaxStreamsUni: transportParameters.initialMaxStreamsUni,
+            peerInitialMaxData: transportParameters.initialMaxData,
+            peerInitialMaxStreamDataBidiLocal: transportParameters.initialMaxStreamDataBidiLocal,
+            peerInitialMaxStreamDataBidiRemote: transportParameters.initialMaxStreamDataBidiRemote,
+            peerInitialMaxStreamDataUni: transportParameters.initialMaxStreamDataUni,
+            peerInitialMaxStreamsBidi: transportParameters.initialMaxStreamsBidi,
+            peerInitialMaxStreamsUni: transportParameters.initialMaxStreamsUni
         )
 
         self.keySchedule = Mutex(KeySchedule())
