@@ -227,17 +227,43 @@ public struct X509Validator: Sendable {
     }
 
     /// Finds the issuer certificate for a given certificate
+    ///
+    /// Uses subject DN matching as the primary filter, then refines with
+    /// Authority Key Identifier (AKI) / Subject Key Identifier (SKI) matching
+    /// when those extensions are present (RFC 5280 Section 4.2.1.1 / 4.2.1.2).
     private func findIssuer(
         for certificate: X509Certificate,
         in candidates: [X509Certificate]
     ) -> X509Certificate? {
-        for candidate in candidates {
-            // Issuer's subject must match certificate's issuer
-            if candidate.subject == certificate.issuer {
-                return candidate
-            }
+        // First pass: collect candidates whose subject matches the certificate's issuer DN
+        let subjectMatches = candidates.filter { $0.subject == certificate.issuer }
+
+        guard !subjectMatches.isEmpty else {
+            return nil
         }
-        return nil
+
+        // If only one candidate matches by subject, return it directly
+        if subjectMatches.count == 1 {
+            return subjectMatches[0]
+        }
+
+        // Multiple candidates share the same subject DN — use AKI/SKI to disambiguate.
+        // RFC 5280 Section 4.2.1.1: The AKI keyIdentifier field, when present,
+        // MUST match the SKI of the issuer certificate.
+        if let aki = certificate.authorityKeyIdentifier,
+           let akiKeyID = aki.keyIdentifier {
+            for candidate in subjectMatches {
+                if let ski = candidate.subjectKeyIdentifier,
+                   akiKeyID == ski.keyIdentifier {
+                    return candidate
+                }
+            }
+            // AKI keyIdentifier present but no matching SKI found —
+            // fall through to first subject match
+        }
+
+        // Fallback: return the first subject match (preserves original behavior)
+        return subjectMatches[0]
     }
 
     // MARK: - Individual Certificate Validation
@@ -461,9 +487,19 @@ public struct X509Validator: Sendable {
             throw X509Error.emptyChain
         }
 
-        // Check if root is in trusted roots
+        // SECURITY: Match trusted roots by Subject Public Key Info (SPKI) DER,
+        // not just subject DN. Two different CAs could share the same subject DN,
+        // but the SPKI (which includes the algorithm identifier and public key bits)
+        // is a strong cryptographic identity. We also check subject DN as a secondary
+        // filter to avoid false matches from key reuse across different entities.
+        let rootSPKI = root.subjectPublicKeyInfoDER
         let isTrusted = trustedRoots.contains { trusted in
-            trusted.subject == root.subject
+            let trustedSPKI = trusted.subjectPublicKeyInfoDER
+            // Primary match: SPKI DER must match (cryptographic identity)
+            // Secondary match: Subject DN must also match (entity identity)
+            return !rootSPKI.isEmpty && !trustedSPKI.isEmpty
+                && rootSPKI == trustedSPKI
+                && trusted.subject == root.subject
         }
 
         if isTrusted {
@@ -554,16 +590,22 @@ public struct X509Validator: Sendable {
             return
         }
 
-        // Check if the required EKU is present
+        // Check if the required EKU is present using the typed helpers
+        // for well-known usages, and OID-based comparison for all others.
         let hasRequiredUsage: Bool
         switch requiredEKU {
         case .serverAuth:
             hasRequiredUsage = eku.isServerAuth
         case .clientAuth:
             hasRequiredUsage = eku.isClientAuth
-        default:
-            // For other EKUs, check by OID
-            hasRequiredUsage = eku.contains { $0 == ExtendedKeyUsage.Usage.serverAuth }
+        case .codeSigning:
+            hasRequiredUsage = eku.contains(.codeSigning)
+        case .emailProtection:
+            hasRequiredUsage = eku.contains(.emailProtection)
+        case .timeStamping:
+            hasRequiredUsage = eku.contains(.timeStamping)
+        case .ocspSigning:
+            hasRequiredUsage = eku.contains(.ocspSigning)
         }
 
         if hasRequiredUsage {

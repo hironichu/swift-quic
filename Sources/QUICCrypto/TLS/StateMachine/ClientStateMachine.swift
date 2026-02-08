@@ -738,13 +738,25 @@ public final class ClientStateMachine: Sendable {
     /// - Returns: TLS outputs including application keys and client Finished
     public func processServerFinished(_ data: Data) throws -> (outputs: [TLSOutput], clientFinished: Data) {
         return try state.withLock { state in
-            // Accept Finished in waitFinished, waitCertificate, or waitCertificateVerify states
-            // (Server may skip Certificate/CertificateVerify in certain modes)
-            switch state.handshakeState {
-            case .waitFinished, .waitCertificate, .waitCertificateVerify:
-                break
-            default:
-                throw TLSHandshakeError.unexpectedMessage("Unexpected Finished in state \(state.handshakeState)")
+            // SECURITY: Only accept Finished in .waitFinished state.
+            //
+            // For non-PSK handshakes, the server MUST send Certificate and
+            // CertificateVerify before Finished (RFC 8446 Section 4.4).
+            // processEncryptedExtensions() transitions to .waitCertificateOrCertificateRequest
+            // for non-PSK flows, and processCertificateVerify() transitions to .waitFinished
+            // after validating the server's signature.
+            //
+            // For PSK handshakes, processEncryptedExtensions() transitions directly
+            // to .waitFinished (skipping Certificate/CertificateVerify as per RFC 8446
+            // Section 2.3), so this check is correct for both flows.
+            //
+            // Accepting Finished in .waitCertificate or .waitCertificateVerify would
+            // allow a malicious server to bypass certificate validation entirely.
+            guard state.handshakeState == .waitFinished else {
+                throw TLSHandshakeError.unexpectedMessage(
+                    "Unexpected Finished in state \(state.handshakeState); " +
+                    "server must complete Certificate/CertificateVerify sequence first"
+                )
             }
 
             let serverFinished = try Finished.decode(from: data)
