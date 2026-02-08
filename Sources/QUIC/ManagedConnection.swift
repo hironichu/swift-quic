@@ -724,7 +724,12 @@ public final class ManagedConnection: Sendable {
     // MARK: - Handshake Helpers
 
     /// Processes TLS outputs and generates packets
-    private func processTLSOutputs(_ outputs: [TLSOutput]) async throws -> [Data] {
+    /// - Parameters:
+    ///   - outputs: TLS outputs to process
+    ///   - shouldSignal: Whether to signal the outbound send loop after generating packets.
+    ///                   Set to `false` when packets will be returned and sent by the caller.
+    ///                   Set to `true` when packets need to trigger the outbound send loop.
+    private func processTLSOutputs(_ outputs: [TLSOutput], shouldSignal: Bool = true) async throws -> [Data] {
         var outboundPackets: [Data] = []
         var handshakeCompleted = false
 
@@ -810,8 +815,9 @@ public final class ManagedConnection: Sendable {
 
         // Signal that packets need to be sent (AFTER all processing is complete)
         // This was moved here from inside the loop to prevent race conditions where
-        // signaling could trigger packet generation before all keys were installed
-        if !outboundPackets.isEmpty {
+        // signaling could trigger packet generation before all keys were installed.
+        // Only signal if requested (e.g., for initial handshake, not for request-response flow)
+        if shouldSignal && !outboundPackets.isEmpty {
             signalNeedsSend()
         }
 
@@ -876,7 +882,8 @@ public final class ManagedConnection: Sendable {
         // Handle crypto data (TLS messages)
         for (level, cryptoData) in result.cryptoData {
             let tlsOutputs = try await tlsProvider.processHandshakeData(cryptoData, at: level)
-            let packets = try await processTLSOutputs(tlsOutputs)
+            // Don't signal - packets will be returned and sent by the caller
+            let packets = try await processTLSOutputs(tlsOutputs, shouldSignal: false)
             outboundPackets.append(contentsOf: packets)
         }
 
