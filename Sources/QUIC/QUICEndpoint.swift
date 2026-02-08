@@ -552,8 +552,9 @@ public actor QUICEndpoint {
                 throw QUICEndpointError.unexpectedPacket
             }
 
-            let connection = try await handleNewConnection(info: info)
-            let responses = try await connection.processDatagram(data)
+            // handleNewConnection now processes the initial packet internally
+            // and returns the response packets to send
+            let responses = try await handleNewConnection(info: info, initialPacket: data)
 
             // Send responses
             for response in responses {
@@ -571,7 +572,18 @@ public actor QUICEndpoint {
     }
 
     /// Handles a new incoming connection (server mode)
-    private func handleNewConnection(info: ConnectionRouter.IncomingConnectionInfo) async throws -> ManagedConnection {
+    ///
+    /// Processes the initial packet before yielding the connection to ensure
+    /// transport parameters are available for HTTP/3 stream initialization.
+    ///
+    /// - Parameters:
+    ///   - info: Connection information from the router
+    ///   - initialPacket: The Initial packet data to process
+    /// - Returns: Response packets to send to the client
+    private func handleNewConnection(
+        info: ConnectionRouter.IncomingConnectionInfo,
+        initialPacket: Data
+    ) async throws -> [Data] {
         // Generate our source connection ID
         // Note: length 8 is always valid (0-20 allowed), so random() will never return nil
         guard let sourceConnectionID = ConnectionID.random(length: 8) else {
@@ -630,10 +642,15 @@ public actor QUICEndpoint {
         // Start handshake (server doesn't send first)
         _ = try await connection.start()
 
-        // Notify about new connection
+        // Process the Initial packet to extract transport parameters
+        // This ensures peer transport parameters are available before yielding
+        // the connection for HTTP/3 initialization
+        let responses = try await connection.processDatagram(initialPacket)
+
+        // Notify about new connection (now with transport parameters processed)
         incomingConnectionContinuation?.yield(connection)
 
-        return connection
+        return responses
     }
 
     // MARK: - Version Negotiation
