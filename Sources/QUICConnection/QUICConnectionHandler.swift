@@ -407,12 +407,15 @@ public final class QUICConnectionHandler: Sendable {
         // Buffer the crypto data
         try cryptoStreamManager.receive(cryptoFrame, at: level)
 
+        // Check if there are pending gaps
+        let hasPendingGaps = cryptoStreamManager.hasPendingGaps(at: level)
+
         // Try to read complete data
         if let data = cryptoStreamManager.read(at: level) {
-            print("[QUICConnectionHandler] Complete CRYPTO data ready at \(level): \(data.count) bytes")
+            print("[QUICConnectionHandler] Complete CRYPTO data ready at \(level): \(data.count) bytes (had gaps: \(hasPendingGaps))")
             result.cryptoData.append((level, data))
         } else {
-            print("[QUICConnectionHandler] Buffered CRYPTO frame, waiting for more data at \(level)")
+            print("[QUICConnectionHandler] Buffered CRYPTO frame, waiting for more data at \(level) (has gaps: \(hasPendingGaps))")
         }
     }
 
