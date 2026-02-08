@@ -538,12 +538,7 @@ public actor QUICEndpoint {
             // Process packet through the connection
             timerManager.recordActivity(for: connection)
             let responses = try await connection.processDatagram(data)
-
-            // Send responses
-            for response in responses {
-                try await send(response, to: remoteAddress)
-            }
-
+            // Responses will be sent by the caller (packetReceiveLoop)
             return responses
 
         case .newConnection(let info):
@@ -554,12 +549,7 @@ public actor QUICEndpoint {
 
             let connection = try await handleNewConnection(info: info)
             let responses = try await connection.processDatagram(data)
-
-            // Send responses
-            for response in responses {
-                try await send(response, to: remoteAddress)
-            }
-
+            // Responses will be sent by the caller (packetReceiveLoop)
             return responses
 
         case .notFound(let dcid):
