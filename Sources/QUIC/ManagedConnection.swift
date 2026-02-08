@@ -493,12 +493,17 @@ public final class ManagedConnection: Sendable {
     private func applyAmplificationLimit(to packets: [Data]) -> [Data] {
         var allowedPackets: [Data] = []
 
-        for packet in packets {
+        print("[ManagedConnection] Amplification limit check: have \(packets.count) packets, limit window: \(amplificationLimiter.availableSendWindow()) bytes")
+
+        for (index, packet) in packets.enumerated() {
             let packetSize = UInt64(packet.count)
 
             if amplificationLimiter.canSend(bytes: packetSize) {
                 amplificationLimiter.recordBytesSent(packetSize)
                 allowedPackets.append(packet)
+                print("[ManagedConnection] Packet \(index+1)/\(packets.count): \(packetSize) bytes ALLOWED, remaining window: \(amplificationLimiter.availableSendWindow())")
+            } else {
+                print("[ManagedConnection] Packet \(index+1)/\(packets.count): \(packetSize) bytes BLOCKED by amplification limit")
             }
             // Packets that exceed the limit are dropped
             // They will be retransmitted once more data is received
