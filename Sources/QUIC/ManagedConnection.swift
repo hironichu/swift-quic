@@ -1163,7 +1163,7 @@ extension ManagedConnection: QUICConnectionProtocol {
 
     public func sendDatagram(_ data: Data) async throws {
         // Check if datagrams are supported (negotiated with peer)
-        guard let peerParams = peerTransportParameters,
+        guard let peerParams = handler.getPeerTransportParameters(),
               peerParams.maxDatagramFrameSize > 0 else {
             throw QUICError.datagramsNotSupported
         }
