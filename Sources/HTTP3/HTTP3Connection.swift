@@ -1,4 +1,4 @@
-/// HTTP/3 Connection Manager (RFC 9114 Section 3)
+/// HTTP/3 Connection Manager (RFC 9114, RFC 9218)
 ///
 /// Manages the HTTP/3-specific aspects of a QUIC connection:
 ///
@@ -43,6 +43,7 @@
 
 import Foundation
 import QUICCore
+import QUICStream
 import QPACK
 
 // MARK: - HTTP/3 Connection
@@ -161,6 +162,21 @@ public actor HTTP3Connection {
 
     /// Whether the peer's QPACK decoder stream has been received
     private var peerQPACKDecoderStreamReceived: Bool = false
+
+    // MARK: - Priority Tracking (RFC 9218)
+
+    /// Stream priorities received via PRIORITY_UPDATE frames.
+    ///
+    /// Maps stream IDs to their dynamically-updated priorities.
+    /// These override the initial priority from the Priority header.
+    private var streamPriorities: [UInt64: StreamPriority] = [:]
+
+    /// Pending PRIORITY_UPDATE frames for streams not yet created.
+    ///
+    /// Per RFC 9218 Section 7, a client can send PRIORITY_UPDATE for
+    /// a stream ID before that stream is opened. The server stores
+    /// these and applies them when the stream is created.
+    private var pendingPriorityUpdates: [UInt64: StreamPriority] = [:]
 
     // MARK: - Incoming Request Handling
 
@@ -614,6 +630,28 @@ public actor HTTP3Connection {
                             return
                         }
 
+                    case .priorityUpdateRequest(let streamID, let priority):
+                        // RFC 9218: Dynamic reprioritization of request streams
+                        // Only valid from a client (received by server)
+                        if role == .server {
+                            handlePriorityUpdate(streamID: streamID, priority: priority)
+                        } else {
+                            // Clients shouldn't receive request PRIORITY_UPDATE
+                            await close(error: .frameUnexpected)
+                            return
+                        }
+
+                    case .priorityUpdatePush(let pushID, let priority):
+                        // RFC 9218: Dynamic reprioritization of push streams
+                        // Only valid from a client (received by server)
+                        if role == .server {
+                            handlePriorityUpdate(streamID: pushID, priority: priority)
+                        } else {
+                            // Clients shouldn't receive push PRIORITY_UPDATE
+                            await close(error: .frameUnexpected)
+                            return
+                        }
+
                     case .cancelPush:
                         // Push cancellation — not implemented yet
                         break
@@ -706,6 +744,10 @@ public actor HTTP3Connection {
     ///
     /// Reads HEADERS and optional DATA frames, constructs an HTTP3Request,
     /// and delivers it via the `incomingRequests` async stream.
+    ///
+    /// Also extracts the Priority header (RFC 9218) from the request
+    /// headers to set the initial stream priority, and checks for any
+    /// pending PRIORITY_UPDATE that may have arrived before the stream.
     private func handleIncomingRequestStream(_ stream: any QUICStreamProtocol) async {
         do {
             // Read frames from the request stream
@@ -764,6 +806,25 @@ public actor HTTP3Connection {
                 return
             }
 
+            // Extract Priority header (RFC 9218 Section 5.1)
+            let priorityHeaderValue = headers.first(where: { $0.name.lowercased() == "priority" })?.value
+            let initialPriority = StreamPriority.fromHeader(priorityHeaderValue)
+
+            // Check for pending PRIORITY_UPDATE (may have arrived before the stream)
+            let effectivePriority: StreamPriority
+            if let pendingPriority = pendingPriorityUpdates.removeValue(forKey: stream.id) {
+                // PRIORITY_UPDATE overrides the header
+                effectivePriority = pendingPriority
+            } else if let dynamicPriority = streamPriorities[stream.id] {
+                // Already received a PRIORITY_UPDATE for this stream
+                effectivePriority = dynamicPriority
+            } else {
+                effectivePriority = initialPriority
+            }
+
+            // Track the stream priority
+            streamPriorities[stream.id] = effectivePriority
+
             // Construct the request
             var request = try HTTP3Request.fromHeaderList(headers)
             request.body = bodyData.isEmpty ? nil : bodyData
@@ -787,6 +848,70 @@ public actor HTTP3Connection {
             // Error processing request — reset the stream
             await stream.reset(errorCode: HTTP3ErrorCode.messageError.rawValue)
         }
+    }
+
+    // MARK: - Priority Management (RFC 9218)
+
+    /// Handles a received PRIORITY_UPDATE frame.
+    ///
+    /// If the target stream exists, its priority is updated immediately.
+    /// If the stream hasn't been created yet, the update is stored as pending.
+    ///
+    /// - Parameters:
+    ///   - streamID: The stream or push ID being reprioritized
+    ///   - priority: The new priority
+    private func handlePriorityUpdate(streamID: UInt64, priority: StreamPriority) {
+        // Update the tracked priority
+        streamPriorities[streamID] = priority
+
+        // Also store as pending in case the stream hasn't been opened yet
+        // (the stream will pick this up in handleIncomingRequestStream)
+        pendingPriorityUpdates[streamID] = priority
+    }
+
+    /// Sends a PRIORITY_UPDATE frame for a request stream.
+    ///
+    /// Only clients should call this method. The frame is sent on the
+    /// control stream to dynamically reprioritize a request.
+    ///
+    /// - Parameters:
+    ///   - streamID: The request stream ID to reprioritize
+    ///   - priority: The new priority
+    /// - Throws: `HTTP3Error` if the control stream is not open or write fails
+    public func sendPriorityUpdate(streamID: UInt64, priority: StreamPriority) async throws {
+        guard role == .client else {
+            throw HTTP3Error(code: .internalError, reason: "Only clients can send PRIORITY_UPDATE")
+        }
+
+        guard let controlStream = localControlStream else {
+            throw HTTP3Error(code: .closedCriticalStream, reason: "Control stream not open")
+        }
+
+        let frame = HTTP3Frame.priorityUpdateRequest(streamID: streamID, priority: priority)
+        let encoded = HTTP3FrameCodec.encode(frame)
+        try await controlStream.write(encoded)
+
+        // Track locally
+        streamPriorities[streamID] = priority
+    }
+
+    /// Returns the current priority for a stream.
+    ///
+    /// Checks dynamic priorities (from PRIORITY_UPDATE) first,
+    /// then falls back to the default priority.
+    ///
+    /// - Parameter streamID: The stream ID to query
+    /// - Returns: The effective priority, or `.default` if not tracked
+    public func priority(for streamID: UInt64) -> StreamPriority {
+        streamPriorities[streamID] ?? .default
+    }
+
+    /// Cleans up priority tracking for a closed stream.
+    ///
+    /// - Parameter streamID: The stream ID to clean up
+    private func cleanupStreamPriority(_ streamID: UInt64) {
+        streamPriorities.removeValue(forKey: streamID)
+        pendingPriorityUpdates.removeValue(forKey: streamID)
     }
 
     // MARK: - Response Sending (Server)

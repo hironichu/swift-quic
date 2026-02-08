@@ -170,7 +170,7 @@ final class HTTP3FrameCodecTests: XCTestCase {
     // MARK: - HEADERS Frame
 
     func testEncodeDecodeHeadersFrame() throws {
-        let headerBlock = Data([0x00, 0x00, 0xc0 | 17])  // Minimal QPACK encoded
+        let headerBlock = Data([0x00, 0x00, UInt8(0xc0) | UInt8(17)])  // Minimal QPACK encoded
         let frame = HTTP3Frame.headers(headerBlock)
 
         let encoded = HTTP3FrameCodec.encode(frame)

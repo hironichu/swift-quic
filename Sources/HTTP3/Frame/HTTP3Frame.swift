@@ -1,4 +1,4 @@
-/// HTTP/3 Frame Types and Definitions (RFC 9114 Section 7.2)
+/// HTTP/3 Frame Types and Definitions (RFC 9114 Section 7.2, RFC 9218)
 ///
 /// HTTP/3 frames are the basic protocol unit exchanged on QUIC streams.
 /// Each frame has a type, a length, and a type-dependent payload.
@@ -29,6 +29,7 @@
 /// (RFC 9114 Section 9).
 
 import Foundation
+import QUICStream
 
 // MARK: - Frame Type Identifiers
 
@@ -240,6 +241,36 @@ public enum HTTP3Frame: Sendable {
     /// ```
     case maxPushID(pushID: UInt64)
 
+    /// PRIORITY_UPDATE frame for request streams (RFC 9218 Section 7.1)
+    ///
+    /// Sent on the control stream to dynamically reprioritize a request
+    /// stream. Contains the stream ID and a Priority Field Value.
+    ///
+    /// ```
+    /// PRIORITY_UPDATE Frame {
+    ///   Type (i) = 0x0f0700,
+    ///   Length (i),
+    ///   Prioritized Element ID (i),
+    ///   Priority Field Value (..)
+    /// }
+    /// ```
+    case priorityUpdateRequest(streamID: UInt64, priority: StreamPriority)
+
+    /// PRIORITY_UPDATE frame for push streams (RFC 9218 Section 7.2)
+    ///
+    /// Sent on the control stream to dynamically reprioritize a push
+    /// stream. Contains the push ID and a Priority Field Value.
+    ///
+    /// ```
+    /// PRIORITY_UPDATE Frame {
+    ///   Type (i) = 0x0f0701,
+    ///   Length (i),
+    ///   Prioritized Element ID (i),
+    ///   Priority Field Value (..)
+    /// }
+    /// ```
+    case priorityUpdatePush(pushID: UInt64, priority: StreamPriority)
+
     /// Unknown or extension frame type
     ///
     /// Per RFC 9114 Section 9, implementations MUST ignore unknown
@@ -266,6 +297,10 @@ public enum HTTP3Frame: Sendable {
             return HTTP3FrameType.goaway.rawValue
         case .maxPushID:
             return HTTP3FrameType.maxPushID.rawValue
+        case .priorityUpdateRequest:
+            return PriorityUpdate.requestStreamFrameType
+        case .priorityUpdatePush:
+            return PriorityUpdate.pushStreamFrameType
         case .unknown(let type, _):
             return type
         }
@@ -278,7 +313,8 @@ public enum HTTP3Frame: Sendable {
     /// DATA and HEADERS frames on the control stream are a connection error.
     public var isAllowedOnControlStream: Bool {
         switch self {
-        case .settings, .goaway, .maxPushID, .cancelPush:
+        case .settings, .goaway, .maxPushID, .cancelPush,
+             .priorityUpdateRequest, .priorityUpdatePush:
             return true
         case .unknown:
             // Unknown frames on control stream are allowed (forward compatibility)
@@ -300,7 +336,8 @@ public enum HTTP3Frame: Sendable {
         case .unknown:
             // Unknown frames on request streams are allowed (forward compatibility)
             return true
-        case .settings, .goaway, .maxPushID, .cancelPush:
+        case .settings, .goaway, .maxPushID, .cancelPush,
+             .priorityUpdateRequest, .priorityUpdatePush:
             return false
         }
     }
@@ -316,6 +353,8 @@ public enum HTTP3Frame: Sendable {
             return !headerBlock.isEmpty
         case .unknown(_, let payload):
             return !payload.isEmpty
+        case .priorityUpdateRequest, .priorityUpdatePush:
+            return true
         default:
             return true
         }
@@ -341,6 +380,10 @@ extension HTTP3Frame: CustomStringConvertible {
             return "GOAWAY(streamID=\(streamID))"
         case .maxPushID(let pushID):
             return "MAX_PUSH_ID(pushID=\(pushID))"
+        case .priorityUpdateRequest(let streamID, let priority):
+            return "PRIORITY_UPDATE_REQUEST(streamID=\(streamID), \(priority))"
+        case .priorityUpdatePush(let pushID, let priority):
+            return "PRIORITY_UPDATE_PUSH(pushID=\(pushID), \(priority))"
         case .unknown(let type, let payload):
             return "UNKNOWN(type=0x\(String(type, radix: 16)), \(payload.count) bytes)"
         }
@@ -366,6 +409,10 @@ extension HTTP3Frame: Equatable {
             return a == b
         case (.maxPushID(let a), .maxPushID(let b)):
             return a == b
+        case (.priorityUpdateRequest(let aID, let aPri), .priorityUpdateRequest(let bID, let bPri)):
+            return aID == bID && aPri == bPri
+        case (.priorityUpdatePush(let aID, let aPri), .priorityUpdatePush(let bID, let bPri)):
+            return aID == bID && aPri == bPri
         case (.unknown(let aType, let aPayload), .unknown(let bType, let bPayload)):
             return aType == bType && aPayload == bPayload
         default:

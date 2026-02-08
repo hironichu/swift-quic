@@ -1,4 +1,4 @@
-/// HTTP/3 Frame Codec (RFC 9114 Section 7.1)
+/// HTTP/3 Frame Codec (RFC 9114 Section 7.1, RFC 9218)
 ///
 /// Encodes and decodes HTTP/3 frames to/from their wire format.
 ///
@@ -25,6 +25,7 @@
 
 import Foundation
 import QUICCore
+import QUICStream
 
 // MARK: - HTTP/3 Frame Codec
 
@@ -254,6 +255,14 @@ public enum HTTP3FrameCodec {
             Varint(pushID).encode(to: &payload)
             return (HTTP3FrameType.maxPushID.rawValue, payload)
 
+        case .priorityUpdateRequest(let streamID, let priority):
+            let update = PriorityUpdate(elementID: streamID, priority: priority, isRequestStream: true)
+            return (PriorityUpdate.requestStreamFrameType, update.encodePayload())
+
+        case .priorityUpdatePush(let pushID, let priority):
+            let update = PriorityUpdate(elementID: pushID, priority: priority, isRequestStream: false)
+            return (PriorityUpdate.pushStreamFrameType, update.encodePayload())
+
         case .unknown(let type, let payload):
             return (type, payload)
         }
@@ -296,6 +305,16 @@ public enum HTTP3FrameCodec {
 
     /// Decodes a frame from its type and payload.
     private static func decodeFramePayload(type: UInt64, payload: Data) throws -> HTTP3Frame {
+        // Check for PRIORITY_UPDATE frames first (RFC 9218)
+        if let classification = PriorityUpdate.classify(type) {
+            let update = try PriorityUpdate.decode(from: payload, isRequestStream: classification.isRequestStream)
+            if classification.isRequestStream {
+                return .priorityUpdateRequest(streamID: update.elementID, priority: update.priority)
+            } else {
+                return .priorityUpdatePush(pushID: update.elementID, priority: update.priority)
+            }
+        }
+
         guard let frameType = HTTP3FrameType(rawValue: type) else {
             // Unknown frame type — preserve for forward compatibility
             return .unknown(type: type, payload: payload)

@@ -147,6 +147,7 @@ let package = Package(
                 "QUIC",
                 "QPACK",
                 "QUICCore",
+                "QUICStream",
             ],
             path: "Sources/HTTP3"
         ),
