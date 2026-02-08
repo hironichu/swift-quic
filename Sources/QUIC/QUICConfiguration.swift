@@ -193,27 +193,6 @@ public struct QUICConfiguration: Sendable {
         self.securityMode = nil
     }
 
-    /// Creates a configuration for libp2p
-    public static func libp2p() -> QUICConfiguration {
-        var config = QUICConfiguration()
-        config.alpn = ["libp2p"]
-        return config
-    }
-
-    /// Creates a configuration for libp2p with a custom TLS provider factory.
-    ///
-    /// Use this when implementing libp2p TLS certificate authentication,
-    /// where PeerID is embedded in X.509 certificate extensions.
-    ///
-    /// - Parameter tlsProviderFactory: Factory that creates TLS providers with libp2p certificate support
-    /// - Returns: A configuration ready for libp2p QUIC connections
-    public static func libp2p(tlsProviderFactory: @escaping TLSProviderFactory) -> QUICConfiguration {
-        var config = QUICConfiguration()
-        config.alpn = ["libp2p"]
-        config.tlsProviderFactory = tlsProviderFactory
-        return config
-    }
-
     // MARK: - Security Mode Factory Methods
 
     /// Creates a production configuration with required TLS.

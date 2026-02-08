@@ -28,11 +28,6 @@ public struct ALPNExtension: Sendable, TLSExtensionValue {
         ALPNExtension(protocols: ["h3"])
     }
 
-    /// ALPN for libp2p
-    public static var libp2p: ALPNExtension {
-        ALPNExtension(protocols: ["libp2p"])
-    }
-
     public func encode() -> Data {
         var protocolListData = Data()
         for proto in protocols {

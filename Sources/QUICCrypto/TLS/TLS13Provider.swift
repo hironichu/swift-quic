@@ -298,14 +298,6 @@ public struct TLSConfiguration: Sendable {
         return config
     }
 
-    /// Creates a configuration for libp2p
-    public static func libp2p(serverName: String? = nil) -> TLSConfiguration {
-        var config = TLSConfiguration()
-        config.serverName = serverName
-        config.alpnProtocols = ["libp2p"]
-        return config
-    }
-
     /// Whether this configuration has certificate material for server authentication
     public var hasCertificate: Bool {
         (certificateChain != nil && signingKey != nil) ||

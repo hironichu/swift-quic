@@ -17,13 +17,6 @@ struct QUICConfigurationTests {
         #expect(config.alpn == ["h3"])
     }
 
-    @Test("libp2p configuration")
-    func libp2pConfig() {
-        let config = QUICConfiguration.libp2p()
-
-        #expect(config.alpn == ["libp2p"])
-    }
-
     @Test("Transport parameters from configuration")
     func transportParameters() throws {
         let config = QUICConfiguration()

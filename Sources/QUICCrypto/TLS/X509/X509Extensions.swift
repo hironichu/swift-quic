@@ -246,14 +246,4 @@ extension X509Certificate {
         return nil
     }
 
-    /// The libp2p extension OID
-    public static let libp2pExtensionOID = "1.3.6.1.4.1.53594.1.1"
-
-    /// Gets the libp2p extension value if present
-    ///
-    /// The libp2p extension contains a SignedKey structure with the peer's
-    /// public key and a signature over the TLS certificate's SPKI.
-    public var libp2pExtensionValue: Data? {
-        extensionValue(for: Self.libp2pExtensionOID)
-    }
 }
