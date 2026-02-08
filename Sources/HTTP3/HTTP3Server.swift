@@ -46,6 +46,7 @@
 import Foundation
 import QUICCore
 import QPACK
+import QUIC  // For ManagedConnection type and handshake state checking
 
 // MARK: - HTTP/3 Server
 
@@ -313,6 +314,10 @@ public actor HTTP3Server {
         }
 
         do {
+            // Wait for QUIC handshake to complete before initializing HTTP/3
+            // This ensures transport parameters are exchanged and streams can be opened
+            try await waitForHandshakeComplete(quicConnection, timeout: .seconds(10))
+
             // Initialize HTTP/3 (open control + QPACK streams, send SETTINGS)
             try await h3Connection.initialize()
 
@@ -347,6 +352,47 @@ public actor HTTP3Server {
             // Close the connection with an appropriate error
             await h3Connection.close(error: .internalError)
         }
+    }
+
+    /// Waits for the QUIC handshake to complete
+    ///
+    /// Polls the connection's handshake state until it reaches .established
+    /// or the timeout expires.
+    ///
+    /// - Parameters:
+    ///   - connection: The QUIC connection
+    ///   - timeout: Maximum time to wait (default: 10 seconds)
+    /// - Throws: HTTP3Error if handshake doesn't complete in time
+    private func waitForHandshakeComplete(
+        _ connection: any QUICConnectionProtocol,
+        timeout: Duration = .seconds(10)
+    ) async throws {
+        let deadline = ContinuousClock.now + timeout
+        
+        while ContinuousClock.now < deadline {
+            // Check if handshake is complete
+            // ManagedConnection exposes handshakeState property
+            if let managedConn = connection as? ManagedConnection {
+                if managedConn.handshakeState == .established {
+                    return
+                }
+                if managedConn.handshakeState == .closed ||
+                   managedConn.handshakeState == .closing {
+                    throw HTTP3Error(
+                        code: .internalError,
+                        reason: "Connection closed before handshake completed"
+                    )
+                }
+            }
+            
+            // Wait a bit before checking again
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        
+        throw HTTP3Error(
+            code: .internalError,
+            reason: "Handshake timeout - connection not established"
+        )
     }
 
     /// Removes a connection from the active connections set.
