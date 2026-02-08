@@ -16,6 +16,16 @@ let package = Package(
             name: "QUICCore",
             targets: ["QUICCore"]
         ),
+        // QPACK header compression (RFC 9204)
+        .library(
+            name: "QPACK",
+            targets: ["QPACK"]
+        ),
+        // HTTP/3 protocol (RFC 9114)
+        .library(
+            name: "HTTP3",
+            targets: ["HTTP3"]
+        ),
     ],
     dependencies: [
         // UDP transport
@@ -121,6 +131,26 @@ let package = Package(
             exclude: ["CONTEXT.md"]
         ),
 
+        // MARK: - QPACK (Header Compression, RFC 9204)
+
+        .target(
+            name: "QPACK",
+            dependencies: [],
+            path: "Sources/QPACK"
+        ),
+
+        // MARK: - HTTP/3 (RFC 9114)
+
+        .target(
+            name: "HTTP3",
+            dependencies: [
+                "QUIC",
+                "QPACK",
+                "QUICCore",
+            ],
+            path: "Sources/HTTP3"
+        ),
+
         // MARK: - Tests
 
         .testTarget(
@@ -151,6 +181,18 @@ let package = Package(
             name: "QUICTests",
             dependencies: ["QUIC", "QUICRecovery", "QUICTransport"],
             path: "Tests/QUICTests"
+        ),
+
+        .testTarget(
+            name: "QPACKTests",
+            dependencies: ["QPACK"],
+            path: "Tests/QPACKTests"
+        ),
+
+        .testTarget(
+            name: "HTTP3Tests",
+            dependencies: ["HTTP3", "QUIC", "QPACK", "QUICCore"],
+            path: "Tests/HTTP3Tests"
         ),
 
         // MARK: - Benchmarks (run separately with: swift test --filter QUICBenchmarks)

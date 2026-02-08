@@ -392,8 +392,23 @@ public final class DataStream: Sendable {
             var frames: [StreamFrame] = []
             var remainingBytes = maxBytes
 
-            // Minimum overhead: streamID (1-8) + offset (0-8) + length (1-2) = ~11 bytes typical
-            let minOverhead = 11
+            // Compute actual STREAM frame overhead using varint sizes
+            // Frame layout: type (1 byte) + streamID (varint) + offset (varint) + length (varint)
+            // The offset field is omitted when offset == 0, but we conservatively include it.
+            @inline(__always)
+            func varintSize(_ value: UInt64) -> Int {
+                if value < 64 { return 1 }
+                if value < 16384 { return 2 }
+                if value < 1_073_741_824 { return 4 }
+                return 8
+            }
+
+            let currentSendOffset = `internal`.state.sendOffset
+            let streamOverhead = 1  // frame type byte
+                + varintSize(id)
+                + (currentSendOffset > 0 ? varintSize(currentSendOffset) : 0)
+                + 2  // length field (varint, typically 1-2 bytes for data < 16384)
+            let minOverhead = max(streamOverhead, 3)  // at least type + streamID(1) + length(1)
 
             while remainingBytes > minOverhead {
                 let currentPending = `internal`.sendBuffer.count - `internal`.sendBufferConsumed
@@ -447,10 +462,15 @@ public final class DataStream: Sendable {
                     `internal`.state.sendState = .dataSent
                 }
 
+                // Recalculate actual overhead for this frame using precise varint sizes
+                let actualFrameOverhead = 1  // frame type byte
+                    + varintSize(id)
+                    + (currentOffset > 0 ? varintSize(currentOffset) : 0)
+                    + varintSize(UInt64(dataToSend.count))
                 // Safely subtract to track remaining bytes (saturate at 0)
                 remainingBytes = SafeConversions.saturatingSubtract(
                     remainingBytes,
-                    minOverhead + dataToSend.count
+                    actualFrameOverhead + dataToSend.count
                 )
             }
 

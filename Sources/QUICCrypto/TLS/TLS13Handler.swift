@@ -1019,11 +1019,62 @@ public final class ServerStateMachine: Sendable {
                 throw TLSHandshakeError.certificateVerificationFailed("No leaf certificate")
             }
 
-            let leafCert = try X509Certificate.parse(from: leafCertData)
+            let leafCert: X509Certificate
+            do {
+                leafCert = try X509Certificate.parse(from: leafCertData)
+            } catch {
+                throw TLSHandshakeError.certificateVerificationFailed("Failed to parse client certificate: \(error)")
+            }
             state.context.clientCertificate = leafCert
 
+            // ================================================================
+            // GAP-1 FIX: X.509 chain validation for client certificates (mTLS)
+            //
+            // RFC 5280 Section 4.2.1.12: Client certificates used for TLS
+            // client authentication MUST have the id-kp-clientAuth EKU.
+            //
+            // Previously only the public key was extracted without any chain
+            // or policy validation. This mirrors the validation performed in
+            // ClientStateMachine.processCertificate() for server certificates.
+            // ================================================================
+            if configuration.verifyPeer {
+                // Parse intermediate certificates
+                let intermediateCerts: [X509Certificate] = try certificate.certificates.dropFirst().compactMap { certData in
+                    try X509Certificate.parse(from: certData)
+                }
+
+                // Set up validation options for client certificate
+                var validationOptions = X509ValidationOptions()
+                validationOptions.allowSelfSigned = configuration.allowSelfSigned
+                // RFC 5280 Section 4.2.1.12: clientAuth EKU required for mTLS
+                validationOptions.requiredEKU = .clientAuth
+                // No hostname validation for client certificates (clients don't have hostnames)
+                validationOptions.hostname = nil
+
+                // Create validator with trusted roots
+                let validator = X509Validator(
+                    trustedRoots: configuration.trustedRootCertificates ?? [],
+                    options: validationOptions
+                )
+
+                // Validate the certificate chain
+                do {
+                    try validator.validate(certificate: leafCert, intermediates: intermediateCerts)
+                } catch let error as X509Error {
+                    throw TLSHandshakeError.certificateVerificationFailed(
+                        "Client certificate validation failed: \(error.description)"
+                    )
+                }
+            }
+
             // Extract verification key from certificate
-            state.context.clientVerificationKey = try leafCert.extractPublicKey()
+            do {
+                state.context.clientVerificationKey = try leafCert.extractPublicKey()
+            } catch {
+                throw TLSHandshakeError.certificateVerificationFailed(
+                    "Failed to extract public key from client certificate: \(error)"
+                )
+            }
 
             // Update transcript
             let message = HandshakeCodec.encode(type: .certificate, content: data)

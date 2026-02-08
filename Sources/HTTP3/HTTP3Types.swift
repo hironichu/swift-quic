@@ -1,0 +1,606 @@
+/// HTTP/3 Request/Response Types (RFC 9114)
+///
+/// Core types for representing HTTP/3 requests, responses, and
+/// request handling contexts.
+///
+/// ## Pseudo-Headers (RFC 9114 Section 4.3)
+///
+/// HTTP/3 requests MUST include these pseudo-headers:
+/// - `:method` — HTTP method (GET, POST, etc.)
+/// - `:scheme` — URI scheme (https)
+/// - `:authority` — Host + optional port
+/// - `:path` — Request path
+///
+/// HTTP/3 responses MUST include:
+/// - `:status` — HTTP status code as string ("200", "404", etc.)
+///
+/// Pseudo-headers MUST appear before regular headers and
+/// MUST NOT appear in trailers.
+
+import Foundation
+
+// MARK: - HTTP Method
+
+/// HTTP request methods (RFC 9110 Section 9)
+///
+/// Represents the standard HTTP methods used in HTTP/3 requests.
+/// The raw value matches the method token sent on the wire.
+public enum HTTPMethod: String, Sendable, Hashable, CaseIterable {
+    /// GET method — retrieve a representation of a resource
+    case get = "GET"
+
+    /// POST method — submit data to a resource
+    case post = "POST"
+
+    /// PUT method — replace a resource
+    case put = "PUT"
+
+    /// DELETE method — remove a resource
+    case delete = "DELETE"
+
+    /// HEAD method — same as GET but without a response body
+    case head = "HEAD"
+
+    /// OPTIONS method — describe communication options
+    case options = "OPTIONS"
+
+    /// PATCH method — partially modify a resource
+    case patch = "PATCH"
+
+    /// CONNECT method — establish a tunnel
+    case connect = "CONNECT"
+
+    /// TRACE method — perform a message loop-back test
+    case trace = "TRACE"
+}
+
+extension HTTPMethod: CustomStringConvertible {
+    public var description: String {
+        rawValue
+    }
+}
+
+// MARK: - HTTP/3 Request
+
+/// An HTTP/3 request (RFC 9114 Section 4)
+///
+/// Represents an outgoing or incoming HTTP/3 request with
+/// pseudo-headers, regular headers, and an optional body.
+///
+/// ## Usage
+///
+/// ```swift
+/// // Simple GET request
+/// let request = HTTP3Request(method: .get, url: "https://example.com/api/data")
+///
+/// // POST request with body
+/// let request = HTTP3Request(
+///     method: .post,
+///     url: "https://example.com/api/submit",
+///     headers: [("content-type", "application/json")],
+///     body: Data("{\"key\": \"value\"}".utf8)
+/// )
+/// ```
+public struct HTTP3Request: Sendable, Hashable {
+    /// The HTTP method
+    public var method: HTTPMethod
+
+    /// The URI scheme (e.g., "https")
+    public var scheme: String
+
+    /// The authority (host and optional port, e.g., "example.com:443")
+    public var authority: String
+
+    /// The request path (e.g., "/index.html")
+    public var path: String
+
+    /// Regular (non-pseudo) header fields as (name, value) pairs.
+    /// Names should be lowercase per HTTP/3 convention.
+    public var headers: [(String, String)]
+
+    /// Optional request body data
+    public var body: Data?
+
+    /// Creates an HTTP/3 request from individual components.
+    ///
+    /// - Parameters:
+    ///   - method: The HTTP method (default: `.get`)
+    ///   - scheme: The URI scheme (default: "https")
+    ///   - authority: The host and optional port
+    ///   - path: The request path (default: "/")
+    ///   - headers: Regular header fields (default: empty)
+    ///   - body: Optional request body (default: nil)
+    public init(
+        method: HTTPMethod = .get,
+        scheme: String = "https",
+        authority: String,
+        path: String = "/",
+        headers: [(String, String)] = [],
+        body: Data? = nil
+    ) {
+        self.method = method
+        self.scheme = scheme
+        self.authority = authority
+        self.path = path
+        self.headers = headers
+        self.body = body
+    }
+
+    /// Creates an HTTP/3 request from a URL string.
+    ///
+    /// Parses the URL to extract scheme, authority, and path.
+    /// Supports URLs of the form `https://host:port/path`.
+    ///
+    /// - Parameters:
+    ///   - method: The HTTP method (default: `.get`)
+    ///   - url: The full URL string
+    ///   - headers: Regular header fields (default: empty)
+    ///   - body: Optional request body (default: nil)
+    public init(
+        method: HTTPMethod = .get,
+        url: String,
+        headers: [(String, String)] = [],
+        body: Data? = nil
+    ) {
+        self.method = method
+        self.headers = headers
+        self.body = body
+
+        // Parse the URL
+        // Expected format: scheme://authority/path
+        if let schemeEnd = url.range(of: "://") {
+            self.scheme = String(url[url.startIndex..<schemeEnd.lowerBound])
+            let afterScheme = url[schemeEnd.upperBound...]
+
+            if let pathStart = afterScheme.firstIndex(of: "/") {
+                self.authority = String(afterScheme[afterScheme.startIndex..<pathStart])
+                self.path = String(afterScheme[pathStart...])
+            } else {
+                self.authority = String(afterScheme)
+                self.path = "/"
+            }
+        } else {
+            // No scheme — treat whole string as authority
+            self.scheme = "https"
+            self.authority = url
+            self.path = "/"
+        }
+    }
+
+    // MARK: - Pseudo-Header Conversion
+
+    /// Converts the request to a full header list including pseudo-headers.
+    ///
+    /// Pseudo-headers are placed before regular headers as required
+    /// by RFC 9114 Section 4.3.
+    ///
+    /// - Returns: An array of (name, value) tuples suitable for QPACK encoding
+    public func toHeaderList() -> [(name: String, value: String)] {
+        var result: [(name: String, value: String)] = []
+        result.reserveCapacity(4 + headers.count)
+
+        // Pseudo-headers MUST come first
+        result.append((":method", method.rawValue))
+        result.append((":scheme", scheme))
+        result.append((":authority", authority))
+        result.append((":path", path))
+
+        // Regular headers
+        for header in headers {
+            result.append(header)
+        }
+
+        return result
+    }
+
+    /// Creates an HTTP/3 request from a decoded header list.
+    ///
+    /// Extracts pseudo-headers (`:method`, `:scheme`, `:authority`, `:path`)
+    /// and separates them from regular headers.
+    ///
+    /// - Parameter headers: The decoded header list from QPACK
+    /// - Returns: The constructed request
+    /// - Throws: `HTTP3TypeError` if required pseudo-headers are missing
+    public static func fromHeaderList(_ headers: [(name: String, value: String)]) throws -> HTTP3Request {
+        var method: HTTPMethod?
+        var scheme: String?
+        var authority: String?
+        var path: String?
+        var regularHeaders: [(String, String)] = []
+
+        for (name, value) in headers {
+            switch name {
+            case ":method":
+                guard let m = HTTPMethod(rawValue: value) else {
+                    throw HTTP3TypeError.invalidPseudoHeaderValue(name: ":method", value: value)
+                }
+                guard method == nil else {
+                    throw HTTP3TypeError.duplicatePseudoHeader(":method")
+                }
+                method = m
+            case ":scheme":
+                guard scheme == nil else {
+                    throw HTTP3TypeError.duplicatePseudoHeader(":scheme")
+                }
+                scheme = value
+            case ":authority":
+                guard authority == nil else {
+                    throw HTTP3TypeError.duplicatePseudoHeader(":authority")
+                }
+                authority = value
+            case ":path":
+                guard path == nil else {
+                    throw HTTP3TypeError.duplicatePseudoHeader(":path")
+                }
+                path = value
+            default:
+                // Pseudo-headers after regular headers is a malformed request
+                if name.hasPrefix(":") {
+                    throw HTTP3TypeError.unknownPseudoHeader(name)
+                }
+                regularHeaders.append((name, value))
+            }
+        }
+
+        guard let resolvedMethod = method else {
+            throw HTTP3TypeError.missingPseudoHeader(":method")
+        }
+
+        // CONNECT requests have different requirements
+        if resolvedMethod == .connect {
+            guard let resolvedAuthority = authority else {
+                throw HTTP3TypeError.missingPseudoHeader(":authority")
+            }
+            return HTTP3Request(
+                method: resolvedMethod,
+                scheme: scheme ?? "https",
+                authority: resolvedAuthority,
+                path: path ?? "/",
+                headers: regularHeaders
+            )
+        }
+
+        guard let resolvedScheme = scheme else {
+            throw HTTP3TypeError.missingPseudoHeader(":scheme")
+        }
+        guard let resolvedPath = path else {
+            throw HTTP3TypeError.missingPseudoHeader(":path")
+        }
+
+        return HTTP3Request(
+            method: resolvedMethod,
+            scheme: resolvedScheme,
+            authority: authority ?? "",
+            path: resolvedPath,
+            headers: regularHeaders
+        )
+    }
+
+    // MARK: - Hashable
+
+    public static func == (lhs: HTTP3Request, rhs: HTTP3Request) -> Bool {
+        lhs.method == rhs.method &&
+        lhs.scheme == rhs.scheme &&
+        lhs.authority == rhs.authority &&
+        lhs.path == rhs.path &&
+        lhs.body == rhs.body &&
+        lhs.headers.count == rhs.headers.count &&
+        zip(lhs.headers, rhs.headers).allSatisfy { $0.0 == $1.0 && $0.1 == $1.1 }
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(method)
+        hasher.combine(scheme)
+        hasher.combine(authority)
+        hasher.combine(path)
+        hasher.combine(body)
+        hasher.combine(headers.count)
+        for (name, value) in headers {
+            hasher.combine(name)
+            hasher.combine(value)
+        }
+    }
+}
+
+// MARK: - CustomStringConvertible
+
+extension HTTP3Request: CustomStringConvertible {
+    public var description: String {
+        "\(method) \(scheme)://\(authority)\(path)"
+    }
+}
+
+// MARK: - HTTP/3 Response
+
+/// An HTTP/3 response (RFC 9114 Section 4)
+///
+/// Represents an outgoing or incoming HTTP/3 response with
+/// a status code, headers, and body data.
+///
+/// ## Usage
+///
+/// ```swift
+/// let response = HTTP3Response(
+///     status: 200,
+///     headers: [("content-type", "text/plain")],
+///     body: Data("Hello, World!".utf8)
+/// )
+/// ```
+public struct HTTP3Response: Sendable, Hashable {
+    /// The HTTP status code (e.g., 200, 404, 500)
+    public var status: Int
+
+    /// Response header fields as (name, value) pairs.
+    /// Names should be lowercase per HTTP/3 convention.
+    public var headers: [(String, String)]
+
+    /// The response body data
+    public var body: Data
+
+    /// Creates an HTTP/3 response.
+    ///
+    /// - Parameters:
+    ///   - status: The HTTP status code
+    ///   - headers: Response header fields (default: empty)
+    ///   - body: Response body data (default: empty)
+    public init(
+        status: Int,
+        headers: [(String, String)] = [],
+        body: Data = Data()
+    ) {
+        self.status = status
+        self.headers = headers
+        self.body = body
+    }
+
+    /// The human-readable status text for common status codes.
+    ///
+    /// Returns a standard reason phrase for the status code,
+    /// or "Unknown" for unrecognized codes.
+    public var statusText: String {
+        switch status {
+        case 100: return "Continue"
+        case 101: return "Switching Protocols"
+        case 103: return "Early Hints"
+        case 200: return "OK"
+        case 201: return "Created"
+        case 202: return "Accepted"
+        case 204: return "No Content"
+        case 206: return "Partial Content"
+        case 301: return "Moved Permanently"
+        case 302: return "Found"
+        case 303: return "See Other"
+        case 304: return "Not Modified"
+        case 307: return "Temporary Redirect"
+        case 308: return "Permanent Redirect"
+        case 400: return "Bad Request"
+        case 401: return "Unauthorized"
+        case 403: return "Forbidden"
+        case 404: return "Not Found"
+        case 405: return "Method Not Allowed"
+        case 408: return "Request Timeout"
+        case 409: return "Conflict"
+        case 410: return "Gone"
+        case 413: return "Content Too Large"
+        case 415: return "Unsupported Media Type"
+        case 421: return "Misdirected Request"
+        case 425: return "Too Early"
+        case 429: return "Too Many Requests"
+        case 500: return "Internal Server Error"
+        case 501: return "Not Implemented"
+        case 502: return "Bad Gateway"
+        case 503: return "Service Unavailable"
+        case 504: return "Gateway Timeout"
+        default: return "Unknown"
+        }
+    }
+
+    /// Whether the status code indicates success (2xx)
+    public var isSuccess: Bool {
+        (200..<300).contains(status)
+    }
+
+    /// Whether the status code indicates a redirect (3xx)
+    public var isRedirect: Bool {
+        (300..<400).contains(status)
+    }
+
+    /// Whether the status code indicates a client error (4xx)
+    public var isClientError: Bool {
+        (400..<500).contains(status)
+    }
+
+    /// Whether the status code indicates a server error (5xx)
+    public var isServerError: Bool {
+        (500..<600).contains(status)
+    }
+
+    /// Whether the status code indicates an informational response (1xx)
+    public var isInformational: Bool {
+        (100..<200).contains(status)
+    }
+
+    // MARK: - Pseudo-Header Conversion
+
+    /// Converts the response to a full header list including pseudo-headers.
+    ///
+    /// The `:status` pseudo-header is placed first, followed by
+    /// regular headers.
+    ///
+    /// - Returns: An array of (name, value) tuples suitable for QPACK encoding
+    public func toHeaderList() -> [(name: String, value: String)] {
+        var result: [(name: String, value: String)] = []
+        result.reserveCapacity(1 + headers.count)
+
+        // :status pseudo-header MUST come first
+        result.append((":status", String(status)))
+
+        // Regular headers
+        for header in headers {
+            result.append(header)
+        }
+
+        return result
+    }
+
+    /// Creates an HTTP/3 response from a decoded header list.
+    ///
+    /// Extracts the `:status` pseudo-header and separates it from
+    /// regular headers.
+    ///
+    /// - Parameter headers: The decoded header list from QPACK
+    /// - Returns: The constructed response (body is empty; fill in from DATA frames)
+    /// - Throws: `HTTP3TypeError` if the `:status` pseudo-header is missing or invalid
+    public static func fromHeaderList(_ headers: [(name: String, value: String)]) throws -> HTTP3Response {
+        var status: Int?
+        var regularHeaders: [(String, String)] = []
+
+        for (name, value) in headers {
+            switch name {
+            case ":status":
+                guard status == nil else {
+                    throw HTTP3TypeError.duplicatePseudoHeader(":status")
+                }
+                guard let code = Int(value), (100...599).contains(code) else {
+                    throw HTTP3TypeError.invalidPseudoHeaderValue(name: ":status", value: value)
+                }
+                status = code
+            default:
+                if name.hasPrefix(":") {
+                    throw HTTP3TypeError.unknownPseudoHeader(name)
+                }
+                regularHeaders.append((name, value))
+            }
+        }
+
+        guard let resolvedStatus = status else {
+            throw HTTP3TypeError.missingPseudoHeader(":status")
+        }
+
+        return HTTP3Response(
+            status: resolvedStatus,
+            headers: regularHeaders
+        )
+    }
+
+    // MARK: - Hashable
+
+    public static func == (lhs: HTTP3Response, rhs: HTTP3Response) -> Bool {
+        lhs.status == rhs.status &&
+        lhs.body == rhs.body &&
+        lhs.headers.count == rhs.headers.count &&
+        zip(lhs.headers, rhs.headers).allSatisfy { $0.0 == $1.0 && $0.1 == $1.1 }
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(status)
+        hasher.combine(body)
+        hasher.combine(headers.count)
+        for (name, value) in headers {
+            hasher.combine(name)
+            hasher.combine(value)
+        }
+    }
+}
+
+// MARK: - CustomStringConvertible
+
+extension HTTP3Response: CustomStringConvertible {
+    public var description: String {
+        "\(status) \(statusText) (\(body.count) bytes)"
+    }
+}
+
+// MARK: - HTTP/3 Request Context
+
+/// Context for handling an incoming HTTP/3 request (server-side).
+///
+/// Wraps a received request along with the stream ID and provides
+/// a mechanism to send back a response.
+///
+/// ## Usage
+///
+/// ```swift
+/// for await context in connection.incomingRequests {
+///     print("Received: \(context.request)")
+///     let response = HTTP3Response(
+///         status: 200,
+///         headers: [("content-type", "text/plain")],
+///         body: Data("Hello!".utf8)
+///     )
+///     try await context.respond(response)
+/// }
+/// ```
+public struct HTTP3RequestContext: Sendable {
+    /// The received HTTP/3 request
+    public let request: HTTP3Request
+
+    /// The QUIC stream ID this request arrived on
+    public let streamID: UInt64
+
+    /// Closure to send a response back on the same stream.
+    /// This is set internally by the HTTP/3 connection layer.
+    internal let _respond: @Sendable (HTTP3Response) async throws -> Void
+
+    /// Creates a request context.
+    ///
+    /// - Parameters:
+    ///   - request: The received request
+    ///   - streamID: The QUIC stream ID
+    ///   - respond: Closure to send back a response
+    public init(
+        request: HTTP3Request,
+        streamID: UInt64,
+        respond: @escaping @Sendable (HTTP3Response) async throws -> Void
+    ) {
+        self.request = request
+        self.streamID = streamID
+        self._respond = respond
+    }
+
+    /// Sends a response back to the client on the same stream.
+    ///
+    /// This sends a HEADERS frame (with the response status and headers)
+    /// followed by a DATA frame (with the body) and closes the stream.
+    ///
+    /// - Parameter response: The HTTP/3 response to send
+    /// - Throws: If sending the response fails
+    public func respond(_ response: HTTP3Response) async throws {
+        try await _respond(response)
+    }
+}
+
+// MARK: - Errors
+
+/// Errors related to HTTP/3 type construction and validation
+public enum HTTP3TypeError: Error, Sendable, CustomStringConvertible {
+    /// A required pseudo-header is missing
+    case missingPseudoHeader(String)
+
+    /// A pseudo-header appeared more than once
+    case duplicatePseudoHeader(String)
+
+    /// A pseudo-header has an invalid value
+    case invalidPseudoHeaderValue(name: String, value: String)
+
+    /// An unknown pseudo-header was encountered
+    case unknownPseudoHeader(String)
+
+    /// Pseudo-headers appeared after regular headers
+    case pseudoHeaderAfterRegularHeader(String)
+
+    public var description: String {
+        switch self {
+        case .missingPseudoHeader(let name):
+            return "Missing required pseudo-header: \(name)"
+        case .duplicatePseudoHeader(let name):
+            return "Duplicate pseudo-header: \(name)"
+        case .invalidPseudoHeaderValue(let name, let value):
+            return "Invalid value for pseudo-header \(name): \(value)"
+        case .unknownPseudoHeader(let name):
+            return "Unknown pseudo-header: \(name)"
+        case .pseudoHeaderAfterRegularHeader(let name):
+            return "Pseudo-header \(name) appeared after regular headers"
+        }
+    }
+}
