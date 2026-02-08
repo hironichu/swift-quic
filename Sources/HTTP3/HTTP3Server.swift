@@ -362,36 +362,52 @@ public actor HTTP3Server {
     /// - Parameters:
     ///   - connection: The QUIC connection
     ///   - timeout: Maximum time to wait (default: 10 seconds)
-    /// - Throws: HTTP3Error if handshake doesn't complete in time
+    /// - Throws: HTTP3Error if handshake doesn't complete in time or connection is wrong type
     private func waitForHandshakeComplete(
         _ connection: any QUICConnectionProtocol,
         timeout: Duration = .seconds(10)
     ) async throws {
+        // Ensure we have a ManagedConnection (fail fast if wrong type)
+        guard let managedConn = connection as? ManagedConnection else {
+            throw HTTP3Error(
+                code: .internalError,
+                reason: "Connection must be a ManagedConnection to check handshake state"
+            )
+        }
+        
         let deadline = ContinuousClock.now + timeout
+        
+        // Poll with exponential backoff to reduce CPU usage
+        var sleepDuration: Duration = .milliseconds(1)
+        let maxSleep: Duration = .milliseconds(50)
         
         while ContinuousClock.now < deadline {
             // Check if handshake is complete
-            // ManagedConnection exposes handshakeState property
-            if let managedConn = connection as? ManagedConnection {
-                if managedConn.handshakeState == .established {
-                    return
-                }
-                if managedConn.handshakeState == .closed ||
-                   managedConn.handshakeState == .closing {
-                    throw HTTP3Error(
-                        code: .internalError,
-                        reason: "Connection closed before handshake completed"
-                    )
-                }
+            switch managedConn.handshakeState {
+            case .established:
+                return
+                
+            case .closed, .closing:
+                throw HTTP3Error(
+                    code: .internalError,
+                    reason: "Connection closed before handshake completed"
+                )
+                
+            case .idle, .connecting, .handshakeInProgress:
+                // Still in progress, continue waiting
+                break
             }
             
-            // Wait a bit before checking again
-            try await Task.sleep(for: .milliseconds(10))
+            // Wait before checking again with exponential backoff
+            try await Task.sleep(for: sleepDuration)
+            
+            // Increase sleep duration for next iteration (max 50ms)
+            sleepDuration = min(sleepDuration * 2, maxSleep)
         }
         
         throw HTTP3Error(
             code: .internalError,
-            reason: "Handshake timeout - connection not established"
+            reason: "Handshake timeout - connection not established within \(timeout.components.seconds)s"
         )
     }
 
