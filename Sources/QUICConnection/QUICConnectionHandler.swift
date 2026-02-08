@@ -400,12 +400,17 @@ public final class QUICConnectionHandler: Sendable {
         level: EncryptionLevel,
         result: inout FrameProcessingResult
     ) throws {
+        print("[QUICConnectionHandler] Received CRYPTO frame at \(level): offset=\(cryptoFrame.offset) length=\(cryptoFrame.data.count)")
+
         // Buffer the crypto data
         try cryptoStreamManager.receive(cryptoFrame, at: level)
 
         // Try to read complete data
         if let data = cryptoStreamManager.read(at: level) {
+            print("[QUICConnectionHandler] Complete CRYPTO data ready at \(level): \(data.count) bytes")
             result.cryptoData.append((level, data))
+        } else {
+            print("[QUICConnectionHandler] Buffered CRYPTO frame, waiting for more data at \(level)")
         }
     }
 

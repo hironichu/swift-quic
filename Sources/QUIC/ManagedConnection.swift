@@ -881,9 +881,12 @@ public final class ManagedConnection: Sendable {
 
         // Handle crypto data (TLS messages)
         for (level, cryptoData) in result.cryptoData {
+            print("[ManagedConnection] Processing CRYPTO data at \(level): \(cryptoData.count) bytes")
             let tlsOutputs = try await tlsProvider.processHandshakeData(cryptoData, at: level)
+            print("[ManagedConnection] TLS provider returned \(tlsOutputs.count) outputs: \(tlsOutputs.map { type(of: $0) })")
             // Don't signal - packets will be returned and sent by the caller
             let packets = try await processTLSOutputs(tlsOutputs, shouldSignal: false)
+            print("[ManagedConnection] Generated \(packets.count) packets from TLS outputs")
             outboundPackets.append(contentsOf: packets)
         }
 
