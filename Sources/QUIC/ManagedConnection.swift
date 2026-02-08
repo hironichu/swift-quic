@@ -808,6 +808,13 @@ public final class ManagedConnection: Sendable {
         let packets = try generateOutboundPackets()
         outboundPackets.append(contentsOf: packets)
 
+        // Signal that packets need to be sent (AFTER all processing is complete)
+        // This was moved here from inside the loop to prevent race conditions where
+        // signaling could trigger packet generation before all keys were installed
+        if !outboundPackets.isEmpty {
+            signalNeedsSend()
+        }
+
         // Discard Initial and Handshake keys if handshake completed
         // RFC 9001 Section 4.9.2:
         // - Server: Discard when TLS handshake completes (here)
