@@ -313,6 +313,14 @@ public struct HandshakeContext: Sendable {
     /// For example, this could be an application-specific peer identity.
     public var validatedPeerInfo: (any Sendable)?
 
+    /// Validated certificate chain from X.509 validation (Phase B).
+    ///
+    /// Stored after synchronous chain validation succeeds in `processCertificate()`
+    /// (client-side) or `processClientCertificate()` (server-side).
+    /// Used by `TLS13Handler` to perform async revocation checks after
+    /// the synchronous state machine processing completes.
+    public var validatedChain: ValidatedChain?
+
     public init() {
         self.transcriptHash = TranscriptHash()
         self.keySchedule = TLSKeySchedule()

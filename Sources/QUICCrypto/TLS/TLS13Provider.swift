@@ -6,6 +6,8 @@
 
 import Foundation
 import QUICCore
+@preconcurrency import X509
+import SwiftASN1
 
 // MARK: - TLS 1.3 Provider Protocol
 
@@ -180,6 +182,31 @@ public struct TLSConfiguration: Sendable {
     /// Used by server to select key share group or send HelloRetryRequest
     public var supportedGroups: [NamedGroup]
 
+    /// Revocation checking mode for peer certificates.
+    ///
+    /// Controls how certificate revocation is checked during TLS handshake.
+    /// Revocation checking is performed asynchronously after the synchronous
+    /// certificate chain validation succeeds.
+    ///
+    /// - `.none`: No revocation checking (default)
+    /// - `.ocspStapling`: OCSP stapling only (server provides response)
+    /// - `.ocsp(allowOnlineCheck:softFail:)`: OCSP with optional online check
+    /// - `.crl(cacheDirectory:softFail:)`: CRL checking with optional caching
+    /// - `.bestEffort`: Try available methods, soft-fail if unavailable
+    ///
+    /// - Important: For production deployments, consider enabling at least
+    ///   `.ocspStapling` or `.bestEffort` to detect revoked certificates.
+    public var revocationCheckMode: RevocationCheckMode
+
+    /// HTTP client for online revocation checks (OCSP, CRL).
+    ///
+    /// Required when `revocationCheckMode` involves online checks
+    /// (`.ocsp(allowOnlineCheck: true, ...)`, `.crl(...)`, or `.bestEffort`).
+    ///
+    /// If `nil` and online checking is requested, online checks are skipped
+    /// and the behavior depends on the `softFail` setting of the mode.
+    public var revocationHTTPClient: HTTPClient?
+
     /// Replay protection for 0-RTT early data (server only)
     ///
     /// When set, the server will check incoming 0-RTT tickets against this
@@ -237,6 +264,8 @@ public struct TLSConfiguration: Sendable {
         self.sessionTicket = nil
         self.maxEarlyDataSize = 0
         self.supportedGroups = [.x25519, .secp256r1]
+        self.revocationCheckMode = .none
+        self.revocationHTTPClient = nil
         self.replayProtection = nil
         self.requireClientCertificate = false
         self.certificateValidator = nil
@@ -296,6 +325,75 @@ public struct TLSConfiguration: Sendable {
         config.signingKey = signingKey
 
         return config
+    }
+
+    // MARK: - Trusted Root Helpers
+
+    /// Returns the effective trusted root certificates for validation.
+    ///
+    /// This method resolves the trusted roots by:
+    /// 1. Using `trustedRootCertificates` if already set (parsed `X509Certificate` objects)
+    /// 2. Falling back to parsing `trustedCACertificates` (raw DER bytes) if set
+    /// 3. Returns an empty array if neither is set
+    ///
+    /// This ensures that `trustedCACertificates` (DER) is no longer a dead field —
+    /// it is automatically parsed when `trustedRootCertificates` is not explicitly provided.
+    public var effectiveTrustedRoots: [X509Certificate] {
+        if let roots = trustedRootCertificates, !roots.isEmpty {
+            return roots
+        }
+        // Fall back to parsing DER-encoded CA certificates
+        if let derCerts = trustedCACertificates, !derCerts.isEmpty {
+            return derCerts.compactMap { try? X509Certificate.parse(from: $0) }
+        }
+        return []
+    }
+
+    /// Loads trusted CA certificates from a PEM file and sets `trustedRootCertificates`.
+    ///
+    /// This is a convenience method for configuring trusted CAs from PEM files,
+    /// which is the most common format for CA bundles (e.g., `/etc/ssl/certs/ca-certificates.crt`).
+    ///
+    /// - Parameter path: Path to a PEM file containing one or more CA certificates
+    /// - Throws: `PEMLoader.PEMError` if loading or parsing fails
+    public mutating func loadTrustedCAs(fromPEMFile path: String) throws {
+        let derCerts = try PEMLoader.loadCertificates(fromPath: path)
+        let parsed = try derCerts.map { try X509Certificate.parse(from: $0) }
+        if trustedRootCertificates == nil {
+            trustedRootCertificates = parsed
+        } else {
+            trustedRootCertificates?.append(contentsOf: parsed)
+        }
+    }
+
+    /// Loads trusted CA certificates from PEM-encoded string data and sets `trustedRootCertificates`.
+    ///
+    /// - Parameter pemString: PEM-encoded string containing one or more CA certificates
+    /// - Throws: `PEMLoader.PEMError` if parsing fails
+    public mutating func loadTrustedCAs(fromPEMString pemString: String) throws {
+        let derCerts = try PEMLoader.parseCertificates(from: pemString)
+        let parsed = try derCerts.map { try X509Certificate.parse(from: $0) }
+        if trustedRootCertificates == nil {
+            trustedRootCertificates = parsed
+        } else {
+            trustedRootCertificates?.append(contentsOf: parsed)
+        }
+    }
+
+    /// Adds DER-encoded CA certificates to the trusted root store.
+    ///
+    /// Parses the provided DER data into `X509Certificate` objects and appends
+    /// them to `trustedRootCertificates`.
+    ///
+    /// - Parameter derCertificates: Array of DER-encoded certificate data
+    /// - Throws: If any certificate fails to parse
+    public mutating func addTrustedCAs(derEncoded derCertificates: [Data]) throws {
+        let parsed = try derCertificates.map { try X509Certificate.parse(from: $0) }
+        if trustedRootCertificates == nil {
+            trustedRootCertificates = parsed
+        } else {
+            trustedRootCertificates?.append(contentsOf: parsed)
+        }
     }
 
     /// Whether this configuration has certificate material for server authentication

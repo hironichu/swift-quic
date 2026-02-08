@@ -7,6 +7,28 @@ import Crypto
 @preconcurrency import X509
 import SwiftASN1
 
+// MARK: - Validated Chain Result
+
+/// Result of a successful certificate chain validation.
+///
+/// Contains the validated chain and leaf certificate, which can be used
+/// for subsequent revocation checks or application-level inspection.
+public struct ValidatedChain: Sendable {
+    /// The validated certificate chain, from leaf to root.
+    public let chain: [X509Certificate]
+
+    /// The leaf (end-entity) certificate.
+    public var leaf: X509Certificate { chain[0] }
+
+    /// The issuer of the leaf certificate (if chain has more than one cert).
+    public var leafIssuer: X509Certificate? {
+        chain.count > 1 ? chain[1] : nil
+    }
+
+    /// The root certificate (last in the chain).
+    public var root: X509Certificate? { chain.last }
+}
+
 // MARK: - Validation Options
 
 /// Options for X.509 certificate validation
@@ -681,6 +703,120 @@ public struct X509Validator: Sendable {
             return false
         }
         return url.scheme != nil
+    }
+
+    // MARK: - Chain-Returning Validation
+
+    /// Validates a certificate chain and returns the validated chain.
+    ///
+    /// This performs the same validation as `validate(certificate:intermediates:)`,
+    /// but returns the built chain for use in subsequent operations such as
+    /// revocation checking.
+    ///
+    /// - Parameters:
+    ///   - certificate: The end-entity (leaf) certificate
+    ///   - intermediates: Intermediate CA certificates
+    /// - Returns: The validated chain from leaf to root
+    /// - Throws: X509Error if validation fails
+    public func buildValidatedChain(
+        certificate: X509Certificate,
+        intermediates: [X509Certificate] = []
+    ) throws -> ValidatedChain {
+        // Build the certificate chain
+        let chain = try buildChain(leaf: certificate, intermediates: intermediates)
+
+        // Check chain depth
+        guard chain.count <= options.maxChainDepth + 1 else {
+            throw X509Error.pathLengthExceeded(allowed: options.maxChainDepth, actual: chain.count - 1)
+        }
+
+        // Validate each certificate in the chain
+        for (index, cert) in chain.enumerated() {
+            let isCA = index > 0
+            try validateCertificate(cert, isCA: isCA, depth: index)
+        }
+
+        // Verify signatures in the chain
+        try verifyChainSignatures(chain)
+
+        // Verify Name Constraints from CA certificates (RFC 5280 Section 4.2.1.10)
+        if options.checkNameConstraints {
+            try verifyNameConstraints(chain)
+        }
+
+        // Verify the root is trusted
+        try verifyTrust(chain: chain)
+
+        // Verify hostname if specified
+        if let hostname = options.hostname {
+            try verifyHostname(certificate, hostname: hostname)
+        }
+
+        // Verify Extended Key Usage if required
+        if options.checkExtendedKeyUsage {
+            try verifyExtendedKeyUsage(certificate)
+        }
+
+        // Validate SAN format
+        if options.validateSANFormat {
+            try validateSANFormat(certificate)
+        }
+
+        return ValidatedChain(chain: chain)
+    }
+
+    // MARK: - Async Validation with Revocation
+
+    /// Validates a certificate chain including revocation checking.
+    ///
+    /// This method performs the full synchronous chain validation first,
+    /// then asynchronously checks revocation status for the leaf certificate
+    /// using the provided `RevocationChecker`.
+    ///
+    /// - Parameters:
+    ///   - certificate: The end-entity (leaf) certificate
+    ///   - intermediates: Intermediate CA certificates
+    ///   - revocationChecker: The revocation checker to use
+    ///   - ocspResponse: Optional stapled OCSP response (e.g., from TLS Certificate Status extension)
+    /// - Throws: `X509Error.certificateRevoked` if revoked, or other `X509Error` for chain issues
+    public func validateWithRevocation(
+        certificate: X509Certificate,
+        intermediates: [X509Certificate] = [],
+        revocationChecker: RevocationChecker,
+        ocspResponse: Data? = nil
+    ) async throws {
+        // Step 1: Synchronous chain validation (builds and validates the chain)
+        let validatedChain = try buildValidatedChain(
+            certificate: certificate,
+            intermediates: intermediates
+        )
+
+        // Step 2: Async revocation check on the leaf certificate
+        guard let issuer = validatedChain.leafIssuer else {
+            // Self-signed or single-cert chain — revocation check requires an issuer
+            // for OCSP. Skip revocation if no issuer is available.
+            return
+        }
+
+        let status = try await revocationChecker.checkRevocation(
+            validatedChain.leaf,
+            issuer: issuer,
+            ocspResponse: ocspResponse
+        )
+
+        switch status {
+        case .good:
+            return
+        case .revoked:
+            throw X509Error.certificateRevoked
+        case .unknown:
+            // Unknown status — behavior depends on the checker's mode
+            // (soft-fail modes return .undetermined instead of .unknown)
+            throw X509Error.certificateRevoked
+        case .undetermined:
+            // Soft-fail: could not determine status, allow connection
+            return
+        }
     }
 }
 

@@ -501,4 +501,40 @@ extension PEMLoader {
         let signingKey = try loadPrivateKey(fromPath: privateKeyPath)
         return (certificates, signingKey)
     }
+
+    // MARK: - Trusted CA Loading Helpers
+
+    /// Load trusted CA certificates from a PEM file as parsed `X509Certificate` objects.
+    ///
+    /// This is a convenience method for populating `TLSConfiguration.trustedRootCertificates`
+    /// from PEM CA bundle files (e.g., `/etc/ssl/certs/ca-certificates.crt`).
+    ///
+    /// - Parameter path: Path to a PEM file containing one or more CA certificates
+    /// - Returns: Array of parsed `X509Certificate` objects
+    /// - Throws: `PEMError` if loading fails, or `X509Error` if parsing fails
+    public static func loadCACertificates(fromPath path: String) throws -> [X509Certificate] {
+        let derCerts = try loadCertificates(fromPath: path)
+        return try derCerts.map { try X509Certificate.parse(from: $0) }
+    }
+
+    /// Parse trusted CA certificates from a PEM-encoded string as parsed `X509Certificate` objects.
+    ///
+    /// Useful for loading CA certificates from embedded strings or configuration values.
+    ///
+    /// - Parameter pemString: PEM-encoded string containing one or more CA certificates
+    /// - Returns: Array of parsed `X509Certificate` objects
+    /// - Throws: `PEMError` if parsing the PEM format fails, or `X509Error` if certificate parsing fails
+    public static func parseCACertificates(from pemString: String) throws -> [X509Certificate] {
+        let derCerts = try parseCertificates(from: pemString)
+        return try derCerts.map { try X509Certificate.parse(from: $0) }
+    }
+
+    /// Parse trusted CA certificates from DER-encoded data into `X509Certificate` objects.
+    ///
+    /// - Parameter derCertificates: Array of DER-encoded certificate data
+    /// - Returns: Array of parsed `X509Certificate` objects
+    /// - Throws: `X509Error` if any certificate fails to parse
+    public static func parseCACertificates(fromDER derCertificates: [Data]) throws -> [X509Certificate] {
+        try derCertificates.map { try X509Certificate.parse(from: $0) }
+    }
 }

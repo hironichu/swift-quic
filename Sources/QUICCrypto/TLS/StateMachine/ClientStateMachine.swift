@@ -620,15 +620,23 @@ public final class ClientStateMachine: Sendable {
                 // RFC 5280 Section 4.2.1.12: Server certificates MUST have serverAuth EKU
                 validationOptions.requiredEKU = .serverAuth
 
-                // Create validator with trusted roots
+                // Create validator with effective trusted roots.
+                // effectiveTrustedRoots resolves trustedRootCertificates first,
+                // then falls back to parsing trustedCACertificates (DER) if set.
                 let validator = X509Validator(
-                    trustedRoots: state.configuration.trustedRootCertificates ?? [],
+                    trustedRoots: state.configuration.effectiveTrustedRoots,
                     options: validationOptions
                 )
 
-                // Validate the certificate chain
+                // Validate the certificate chain and store the validated chain
+                // for subsequent revocation checking (Phase B integration).
                 do {
-                    try validator.validate(certificate: leafCert, intermediates: Array(intermediateCerts))
+                    let validatedChain = try validator.buildValidatedChain(
+                        certificate: leafCert,
+                        intermediates: Array(intermediateCerts)
+                    )
+                    // Store chain for async revocation check in TLS13Handler
+                    state.context.validatedChain = validatedChain
                 } catch let error as X509Error {
                     throw TLSHandshakeError.certificateVerificationFailed(error.description)
                 }
@@ -1010,5 +1018,25 @@ public final class ClientStateMachine: Sendable {
     /// after successful certificate validation (e.g., application-specific peer identity).
     public var validatedPeerInfo: (any Sendable)? {
         state.withLock { $0.context.validatedPeerInfo }
+    }
+
+    /// The validated certificate chain from the most recent certificate processing.
+    ///
+    /// Available after `processCertificate()` succeeds with `verifyPeer == true`.
+    /// Used by `TLS13Handler` to perform async revocation checks.
+    public var validatedChain: ValidatedChain? {
+        state.withLock { $0.context.validatedChain }
+    }
+
+    /// Takes (removes and returns) the validated chain from context.
+    ///
+    /// This ensures the revocation check is performed exactly once per
+    /// certificate processing — the chain is consumed on first access.
+    public func takeValidatedChain() -> ValidatedChain? {
+        state.withLock { state in
+            let chain = state.context.validatedChain
+            state.context.validatedChain = nil
+            return chain
+        }
     }
 }

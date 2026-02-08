@@ -97,7 +97,10 @@ public final class TLS13Handler: TLS13Provider, Sendable {
     }
 
     public func processHandshakeData(_ data: Data, at level: EncryptionLevel) async throws -> [TLSOutput] {
-        return try state.withLock { state in
+        // Phase 1: Synchronous message processing (inside lock).
+        // Returns outputs and a flag indicating whether a certificate message
+        // was processed (so we can perform async revocation checking outside the lock).
+        let (outputs, certificateProcessed) = try state.withLock { state -> ([TLSOutput], Bool) in
             // Append to level-specific buffer
             var buffer = state.messageBuffers[level] ?? Data()
             buffer.append(data)
@@ -108,6 +111,7 @@ public final class TLS13Handler: TLS13Provider, Sendable {
             }
 
             var outputs: [TLSOutput] = []
+            var certProcessed = false
 
             // Process complete messages from buffer
             while buffer.count >= 4 {
@@ -137,13 +141,31 @@ public final class TLS13Handler: TLS13Provider, Sendable {
                     state: &state
                 )
                 outputs.append(contentsOf: messageOutputs)
+
+                // Track if a certificate message was processed
+                if messageType == .certificate {
+                    certProcessed = true
+                }
             }
 
             // Store updated buffer
             state.messageBuffers[level] = buffer
 
-            return outputs
+            return (outputs, certProcessed)
         }
+
+        // Phase 2: Async revocation check (outside lock).
+        // Only performed when a certificate was just processed AND
+        // revocation checking is configured (not .none).
+        if certificateProcessed {
+            if case .none = configuration.revocationCheckMode {
+                // No revocation checking configured — skip
+            } else {
+                try await performRevocationCheckIfNeeded()
+            }
+        }
+
+        return outputs
     }
 
     public func getLocalTransportParameters() -> Data {
@@ -227,6 +249,64 @@ public final class TLS13Handler: TLS13Provider, Sendable {
             } else {
                 return state.serverStateMachine?.validatedPeerInfo
             }
+        }
+    }
+
+    // MARK: - Revocation Checking
+
+    /// Performs async revocation checking on the most recently validated certificate chain.
+    ///
+    /// Called after synchronous certificate processing succeeds and exits the state lock.
+    /// Takes (consumes) the validated chain from the appropriate state machine so the
+    /// check is performed exactly once per certificate.
+    ///
+    /// - Throws: `TLSHandshakeError.certificateVerificationFailed` if the certificate is revoked
+    private func performRevocationCheckIfNeeded() async throws {
+        // Determine which state machine has the validated chain
+        let validatedChain: ValidatedChain? = state.withLock { state in
+            if state.isClientMode {
+                return state.clientStateMachine?.takeValidatedChain()
+            } else {
+                return state.serverStateMachine?.takeValidatedChain()
+            }
+        }
+
+        guard let chain = validatedChain else {
+            // No validated chain available (e.g., verifyPeer was false,
+            // or expectedPeerPublicKey was used). Nothing to check.
+            return
+        }
+
+        guard let issuer = chain.leafIssuer else {
+            // Self-signed or single-cert chain — OCSP/CRL requires an issuer.
+            // Skip revocation check.
+            return
+        }
+
+        let checker = RevocationChecker(
+            mode: configuration.revocationCheckMode,
+            httpClient: configuration.revocationHTTPClient
+        )
+
+        let status = try await checker.checkRevocation(
+            chain.leaf,
+            issuer: issuer
+        )
+
+        switch status {
+        case .good, .undetermined:
+            // Good or soft-fail: allow the handshake to continue
+            return
+        case .revoked(let reason, _):
+            let reasonStr = reason.map { "\($0)" } ?? "unspecified"
+            throw TLSHandshakeError.certificateVerificationFailed(
+                "Certificate revoked (reason: \(reasonStr))"
+            )
+        case .unknown:
+            // Unknown status from the responder — treat as failure
+            throw TLSHandshakeError.certificateVerificationFailed(
+                "Certificate revocation status unknown"
+            )
         }
     }
 
@@ -1051,15 +1131,23 @@ public final class ServerStateMachine: Sendable {
                 // No hostname validation for client certificates (clients don't have hostnames)
                 validationOptions.hostname = nil
 
-                // Create validator with trusted roots
+                // Create validator with effective trusted roots.
+                // effectiveTrustedRoots resolves trustedRootCertificates first,
+                // then falls back to parsing trustedCACertificates (DER) if set.
                 let validator = X509Validator(
-                    trustedRoots: configuration.trustedRootCertificates ?? [],
+                    trustedRoots: configuration.effectiveTrustedRoots,
                     options: validationOptions
                 )
 
-                // Validate the certificate chain
+                // Validate the certificate chain and store the validated chain
+                // for subsequent revocation checking (Phase B integration).
                 do {
-                    try validator.validate(certificate: leafCert, intermediates: intermediateCerts)
+                    let validatedChain = try validator.buildValidatedChain(
+                        certificate: leafCert,
+                        intermediates: intermediateCerts
+                    )
+                    // Store chain for async revocation check
+                    state.context.validatedChain = validatedChain
                 } catch let error as X509Error {
                     throw TLSHandshakeError.certificateVerificationFailed(
                         "Client certificate validation failed: \(error.description)"
@@ -1293,6 +1381,26 @@ public final class ServerStateMachine: Sendable {
     /// Parsed peer leaf certificate
     public var peerCertificate: X509Certificate? {
         state.withLock { $0.context.peerCertificate }
+    }
+
+    /// The validated certificate chain from the most recent client certificate processing.
+    ///
+    /// Available after `processClientCertificate()` succeeds with `verifyPeer == true`.
+    /// Used by `TLS13Handler` to perform async revocation checks.
+    public var validatedChain: ValidatedChain? {
+        state.withLock { $0.context.validatedChain }
+    }
+
+    /// Takes (removes and returns) the validated chain from context.
+    ///
+    /// This ensures the revocation check is performed exactly once per
+    /// certificate processing — the chain is consumed on first access.
+    public func takeValidatedChain() -> ValidatedChain? {
+        state.withLock { state in
+            let chain = state.context.validatedChain
+            state.context.validatedChain = nil
+            return chain
+        }
     }
 }
 
