@@ -5,6 +5,7 @@
 
 import Testing
 import Foundation
+import Crypto
 import Synchronization
 @testable import QUIC
 @testable import QUICCore
@@ -920,14 +921,8 @@ struct TLS13HandlerDirectTests {
         let p256KeyExchange = try KeyExchange.generate(for: .secp256r1)
 
         // Create a ClientHello with only P-256 key share
-        var random = Data(count: 32)
-        random.withUnsafeMutableBytes { ptr in
-            _ = SecRandomCopyBytes(kSecRandomDefault, 32, ptr.baseAddress!)
-        }
-        var sessionID = Data(count: 32)
-        sessionID.withUnsafeMutableBytes { ptr in
-            _ = SecRandomCopyBytes(kSecRandomDefault, 32, ptr.baseAddress!)
-        }
+        let random = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+        let sessionID = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
 
         let extensions: [TLSExtension] = [
             .supportedVersionsClient([TLSConstants.version13]),
@@ -1008,14 +1003,8 @@ struct TLS13HandlerDirectTests {
         let p256KeyExchange = try KeyExchange.generate(for: .secp256r1)
 
         // Create first ClientHello with only P-256 key share
-        var random = Data(count: 32)
-        random.withUnsafeMutableBytes { ptr in
-            _ = SecRandomCopyBytes(kSecRandomDefault, 32, ptr.baseAddress!)
-        }
-        var sessionID = Data(count: 32)
-        sessionID.withUnsafeMutableBytes { ptr in
-            _ = SecRandomCopyBytes(kSecRandomDefault, 32, ptr.baseAddress!)
-        }
+        let random = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+        let sessionID = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
 
         let extensions1: [TLSExtension] = [
             .supportedVersionsClient([TLSConstants.version13]),
@@ -1120,14 +1109,8 @@ struct TLS13HandlerDirectTests {
 
         let p256KeyExchange = try KeyExchange.generate(for: .secp256r1)
 
-        var random = Data(count: 32)
-        random.withUnsafeMutableBytes { ptr in
-            _ = SecRandomCopyBytes(kSecRandomDefault, 32, ptr.baseAddress!)
-        }
-        var sessionID = Data(count: 32)
-        sessionID.withUnsafeMutableBytes { ptr in
-            _ = SecRandomCopyBytes(kSecRandomDefault, 32, ptr.baseAddress!)
-        }
+        let random = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
+        let sessionID = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
 
         let extensions: [TLSExtension] = [
             .supportedVersionsClient([TLSConstants.version13]),

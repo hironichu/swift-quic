@@ -3,6 +3,8 @@
 import Testing
 import Foundation
 import Crypto
+@preconcurrency import X509
+import SwiftASN1
 @testable import QUICCrypto
 
 @Suite("X.509 Tests")
@@ -269,7 +271,7 @@ struct X509Tests {
 
     @Test("CertificateStore adds and retrieves certificates")
     func certificateStore() throws {
-        var store = CertificateStore()
+        var store = QUICCrypto.CertificateStore()
         #expect(store.all.isEmpty)
 
         // We can't easily test adding certificates without a real certificate,
@@ -361,5 +363,110 @@ struct X509Tests {
 
         let verificationKey = signingKey.verificationKey
         #expect(verificationKey.scheme == .ecdsa_secp256r1_sha256)
+    }
+
+    // MARK: - signatureValue Extraction Tests
+
+    /// Helper: creates a self-signed X509Certificate (our wrapper) using swift-certificates
+    private static func makeSelfSignedCertificate(
+        key: P256.Signing.PrivateKey = P256.Signing.PrivateKey()
+    ) throws -> (X509Certificate, P256.Signing.PrivateKey) {
+        let name = try DistinguishedName {
+            CommonName("Test Self-Signed")
+            OrganizationName("swift-quic Tests")
+        }
+
+        let cert = try Certificate(
+            version: .v3,
+            serialNumber: Certificate.SerialNumber(),
+            publicKey: .init(key.publicKey),
+            notValidBefore: Date().addingTimeInterval(-60),
+            notValidAfter: Date().addingTimeInterval(3600),
+            issuer: name,
+            subject: name,
+            signatureAlgorithm: .ecdsaWithSHA256,
+            extensions: Certificate.Extensions {
+                Critical(BasicConstraints.isCertificateAuthority(maxPathLength: nil))
+            },
+            issuerPrivateKey: .init(key)
+        )
+
+        var serializer = DER.Serializer()
+        try cert.serialize(into: &serializer)
+        let derData = Data(serializer.serializedBytes)
+
+        let wrapped = try X509Certificate.parse(from: derData)
+        return (wrapped, key)
+    }
+
+    @Test("signatureValue returns non-empty data for a real certificate")
+    func signatureValueNonEmpty() throws {
+        let (cert, _) = try X509Tests.makeSelfSignedCertificate()
+
+        let sig = cert.signatureValue
+        #expect(!sig.isEmpty, "signatureValue must not be empty")
+        // ECDSA P-256 DER signatures are typically 70-72 bytes
+        #expect(sig.count >= 64, "ECDSA P-256 signature should be at least 64 bytes, got \(sig.count)")
+    }
+
+    @Test("signatureValue can be verified against tbsCertificateBytes")
+    func signatureValueVerifiesAgainstTBS() throws {
+        let (cert, key) = try X509Tests.makeSelfSignedCertificate()
+
+        let sig = cert.signatureValue
+        let tbs = cert.tbsCertificateBytes
+        #expect(!sig.isEmpty)
+        #expect(!tbs.isEmpty)
+
+        // Verify using CryptoKit directly — the raw ECDSA DER signature over the TBS bytes
+        let ecdsaSig = try P256.Signing.ECDSASignature(derRepresentation: sig)
+        let valid = key.publicKey.isValidSignature(ecdsaSig, for: tbs)
+        #expect(valid, "Signature extracted by signatureValue must verify against tbsCertificateBytes")
+    }
+
+    @Test("signatureValue works with VerificationKey.verify()")
+    func signatureValueWorksWithVerificationKey() throws {
+        let (cert, _) = try X509Tests.makeSelfSignedCertificate()
+
+        // Extract VerificationKey the same way X509Validator does
+        let verificationKey = try cert.extractPublicKey()
+        #expect(verificationKey.scheme == .ecdsa_secp256r1_sha256)
+
+        let valid = try verificationKey.verify(
+            signature: cert.signatureValue,
+            for: cert.tbsCertificateBytes
+        )
+        #expect(valid, "VerificationKey.verify must succeed with the extracted signatureValue")
+    }
+
+    @Test("X509Validator validates a self-signed certificate chain end-to-end")
+    func selfSignedCertificateValidation() throws {
+        let (cert, _) = try X509Tests.makeSelfSignedCertificate()
+
+        // Build a validator that trusts the self-signed cert as root
+        let options = X509ValidationOptions(
+            checkValidity: true,
+            checkBasicConstraints: true,
+            checkKeyUsage: false,           // Test cert has no KeyUsage extension
+            checkExtendedKeyUsage: false,   // Test cert has no EKU extension
+            validateSANFormat: false,       // Test cert has no SAN
+            allowSelfSigned: true
+        )
+        let validator = X509Validator(trustedRoots: [cert], options: options)
+
+        // This exercises verifyChainSignatures -> verifySignature -> signatureValue
+        #expect(throws: Never.self) {
+            try validator.validate(certificate: cert)
+        }
+    }
+
+    @Test("signatureValue differs between certificates signed by different keys")
+    func signatureValueDiffersBetweenCerts() throws {
+        let (cert1, _) = try X509Tests.makeSelfSignedCertificate()
+        let (cert2, _) = try X509Tests.makeSelfSignedCertificate()
+
+        // Different keys => different signatures (overwhelmingly likely)
+        #expect(cert1.signatureValue != cert2.signatureValue,
+                "Different keys should produce different signatures")
     }
 }

@@ -234,4 +234,152 @@ struct PreferredAddressRFCTests {
         #expect(preferred.ipv4Address != nil)
         #expect(preferred.ipv6Address == nil)
     }
+
+    // MARK: - IPv6 Round-Trip Tests
+
+    @Test("IPv6 preferred address round-trips through encode/decode")
+    func ipv6PreferredAddressRoundtrip() throws {
+        // RFC 9000 §18.2: The server's preferred address includes both IPv4 and IPv6
+
+        var params = TransportParameters()
+        params.preferredAddress = PreferredAddress(
+            ipv4Address: "192.0.2.1",
+            ipv4Port: 443,
+            ipv6Address: "2001:db8::1",
+            ipv6Port: 8443,
+            connectionID: try ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])),
+            statelessResetToken: Data(repeating: 0xCC, count: 16)
+        )
+
+        let encoded = TransportParameterCodec.encode(params)
+        let decoded = try TransportParameterCodec.decode(encoded)
+
+        #expect(decoded.preferredAddress != nil)
+        #expect(decoded.preferredAddress?.ipv4Address == "192.0.2.1")
+        #expect(decoded.preferredAddress?.ipv4Port == 443)
+        #expect(decoded.preferredAddress?.ipv6Address == "2001:db8::1")
+        #expect(decoded.preferredAddress?.ipv6Port == 8443)
+        #expect(decoded.preferredAddress?.connectionID.bytes == Data([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]))
+        #expect(decoded.preferredAddress?.statelessResetToken == Data(repeating: 0xCC, count: 16))
+    }
+
+    @Test("Full IPv6 address (no compression) round-trips correctly")
+    func fullIPv6AddressRoundtrip() throws {
+        var params = TransportParameters()
+        params.preferredAddress = PreferredAddress(
+            ipv4Address: nil,
+            ipv4Port: nil,
+            ipv6Address: "2001:db8:85a3:0:0:8a2e:370:7334",
+            ipv6Port: 443,
+            connectionID: try ConnectionID(bytes: Data([0xAA, 0xBB])),
+            statelessResetToken: Data(repeating: 0x11, count: 16)
+        )
+
+        let encoded = TransportParameterCodec.encode(params)
+        let decoded = try TransportParameterCodec.decode(encoded)
+
+        #expect(decoded.preferredAddress?.ipv6Address == "2001:db8:85a3::8a2e:370:7334")
+        #expect(decoded.preferredAddress?.ipv6Port == 443)
+    }
+
+    @Test("Loopback ::1 round-trips correctly")
+    func ipv6LoopbackRoundtrip() throws {
+        var params = TransportParameters()
+        params.preferredAddress = PreferredAddress(
+            ipv4Address: "127.0.0.1",
+            ipv4Port: 443,
+            ipv6Address: "::1",
+            ipv6Port: 443,
+            connectionID: try ConnectionID(bytes: Data([0x01])),
+            statelessResetToken: Data(repeating: 0x22, count: 16)
+        )
+
+        let encoded = TransportParameterCodec.encode(params)
+        let decoded = try TransportParameterCodec.decode(encoded)
+
+        #expect(decoded.preferredAddress?.ipv6Address == "::1")
+        #expect(decoded.preferredAddress?.ipv6Port == 443)
+    }
+
+    @Test("Link-local fe80:: address round-trips correctly")
+    func ipv6LinkLocalRoundtrip() throws {
+        var params = TransportParameters()
+        params.preferredAddress = PreferredAddress(
+            ipv4Address: nil,
+            ipv4Port: nil,
+            ipv6Address: "fe80::1",
+            ipv6Port: 9000,
+            connectionID: try ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04])),
+            statelessResetToken: Data(repeating: 0x33, count: 16)
+        )
+
+        let encoded = TransportParameterCodec.encode(params)
+        let decoded = try TransportParameterCodec.decode(encoded)
+
+        #expect(decoded.preferredAddress?.ipv6Address == "fe80::1")
+        #expect(decoded.preferredAddress?.ipv6Port == 9000)
+    }
+
+    @Test("All-ones IPv6 address ffff:...:ffff round-trips correctly")
+    func ipv6AllOnesRoundtrip() throws {
+        var params = TransportParameters()
+        params.preferredAddress = PreferredAddress(
+            ipv4Address: nil,
+            ipv4Port: nil,
+            ipv6Address: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            ipv6Port: 1234,
+            connectionID: try ConnectionID(bytes: Data([0xFF])),
+            statelessResetToken: Data(repeating: 0x44, count: 16)
+        )
+
+        let encoded = TransportParameterCodec.encode(params)
+        let decoded = try TransportParameterCodec.decode(encoded)
+
+        #expect(decoded.preferredAddress?.ipv6Address == "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
+        #expect(decoded.preferredAddress?.ipv6Port == 1234)
+    }
+
+    @Test("Nil IPv6 encodes as zeros and decodes back to nil")
+    func nilIPv6EncodesAsZerosAndDecodesAsNil() throws {
+        var params = TransportParameters()
+        params.preferredAddress = PreferredAddress(
+            ipv4Address: "10.0.0.1",
+            ipv4Port: 443,
+            ipv6Address: nil,
+            ipv6Port: nil,
+            connectionID: try ConnectionID(bytes: Data([0x01, 0x02, 0x03, 0x04])),
+            statelessResetToken: Data(repeating: 0x55, count: 16)
+        )
+
+        let encoded = TransportParameterCodec.encode(params)
+        let decoded = try TransportParameterCodec.decode(encoded)
+
+        #expect(decoded.preferredAddress?.ipv6Address == nil)
+        #expect(decoded.preferredAddress?.ipv6Port == nil)
+        // IPv4 should still be intact
+        #expect(decoded.preferredAddress?.ipv4Address == "10.0.0.1")
+        #expect(decoded.preferredAddress?.ipv4Port == 443)
+    }
+
+    @Test("IPv6 with leading-zero-compressed groups round-trips correctly")
+    func ipv6CompressedGroupsRoundtrip() throws {
+        // "2001:db8:0:0:1:0:0:1" has two separate zero runs;
+        // only the first (longer or equal, leftmost) should get "::"
+        var params = TransportParameters()
+        params.preferredAddress = PreferredAddress(
+            ipv4Address: nil,
+            ipv4Port: nil,
+            ipv6Address: "2001:db8:0:0:1:0:0:1",
+            ipv6Port: 443,
+            connectionID: try ConnectionID(bytes: Data([0x01, 0x02])),
+            statelessResetToken: Data(repeating: 0x66, count: 16)
+        )
+
+        let encoded = TransportParameterCodec.encode(params)
+        let decoded = try TransportParameterCodec.decode(encoded)
+
+        // The canonical form compresses the first longest run
+        #expect(decoded.preferredAddress?.ipv6Address == "2001:db8::1:0:0:1")
+        #expect(decoded.preferredAddress?.ipv6Port == 443)
+    }
 }

@@ -223,8 +223,12 @@ public struct TransportParameterCodec: Sendable {
         }
 
         // IPv6 address (16 bytes) + port (2 bytes)
-        // Simplified: write zeros for IPv6 (not fully implemented)
-        for _ in 0..<16 { valueWriter.writeByte(0) }
+        if let ipv6 = addr.ipv6Address, let bytes = parseIPv6String(ipv6), bytes.count == 16 {
+            valueWriter.writeBytes(bytes)
+        } else {
+            // No IPv6 or invalid — write zeros (RFC 9000 §18.2)
+            valueWriter.writeZeroBytes(16)
+        }
         valueWriter.writeUInt16(addr.ipv6Port ?? 0)
 
         // Connection ID length (1 byte) + Connection ID
@@ -359,7 +363,7 @@ public struct TransportParameterCodec: Sendable {
         }
 
         // IPv6: 16 bytes address + 2 bytes port
-        guard let _ = reader.readBytes(16),
+        guard let ipv6Bytes = reader.readBytes(16),
               let ipv6Port = reader.readUInt16() else {
             throw TransportParameterError.decodeError("Invalid preferred address IPv6")
         }
@@ -385,13 +389,127 @@ public struct TransportParameterCodec: Sendable {
         // Parse IPv4 address string
         let ipv4Address = ipv4Bytes.map { String($0) }.joined(separator: ".")
 
+        // Parse IPv6 address — all-zero means not available
+        let ipv6Address: String?
+        if ipv6Bytes.allSatisfy({ $0 == 0 }) {
+            ipv6Address = nil
+        } else {
+            ipv6Address = formatIPv6Address(ipv6Bytes)
+        }
+
         return PreferredAddress(
             ipv4Address: ipv4Address,
             ipv4Port: ipv4Port,
-            ipv6Address: nil,  // IPv6 parsing simplified
-            ipv6Port: ipv6Port,
+            ipv6Address: ipv6Address,
+            ipv6Port: ipv6Address != nil ? ipv6Port : nil,
             connectionID: try ConnectionID(bytes: cidBytes),
             statelessResetToken: resetToken
         )
+    }
+
+    // MARK: - IPv6 Helpers
+
+    /// Parses an IPv6 address string into 16 bytes (network byte order).
+    ///
+    /// Handles standard forms including `::` compression and mixed IPv4 notation:
+    /// - `2001:db8::1`
+    /// - `::1`
+    /// - `fe80::1%eth0` (zone ID stripped)
+    /// - `::ffff:192.0.2.1`
+    private static func parseIPv6String(_ string: String) -> Data? {
+        // Strip zone ID (e.g., "%eth0") if present
+        let address: String
+        if let percentIdx = string.firstIndex(of: "%") {
+            address = String(string[string.startIndex..<percentIdx])
+        } else {
+            address = string
+        }
+
+        // Split on "::" to handle zero-group compression
+        let parts = address.split(separator: "::", maxSplits: 1, omittingEmptySubsequences: false)
+
+        var groups: [UInt16] = []
+
+        if parts.count == 2 {
+            // Has "::" — expand compressed zeros
+            let left = parts[0].isEmpty ? [] : parts[0].split(separator: ":").compactMap { parseIPv6Group($0) }
+            let right = parts[1].isEmpty ? [] : parts[1].split(separator: ":").compactMap { parseIPv6Group($0) }
+
+            let leftCount = left.count
+            let rightCount = right.count
+            guard leftCount + rightCount <= 8 else { return nil }
+
+            groups.append(contentsOf: left)
+            let zeroCount = 8 - leftCount - rightCount
+            groups.append(contentsOf: [UInt16](repeating: 0, count: zeroCount))
+            groups.append(contentsOf: right)
+        } else {
+            // No "::" — must have exactly 8 groups
+            groups = address.split(separator: ":").compactMap { parseIPv6Group($0) }
+        }
+
+        guard groups.count == 8 else { return nil }
+
+        // Convert to 16 bytes (network byte order)
+        var result = Data(capacity: 16)
+        for group in groups {
+            result.append(UInt8(group >> 8))
+            result.append(UInt8(group & 0xFF))
+        }
+        return result
+    }
+
+    /// Parses a single IPv6 group (1-4 hex characters) into a UInt16.
+    private static func parseIPv6Group<S: StringProtocol>(_ group: S) -> UInt16? {
+        guard group.count >= 1 && group.count <= 4 else { return nil }
+        return UInt16(group, radix: 16)
+    }
+
+    /// Formats 16 bytes as a canonical IPv6 address string with `::` compression (RFC 5952).
+    private static func formatIPv6Address(_ bytes: Data) -> String {
+        precondition(bytes.count == 16)
+
+        // Read 8 groups of UInt16 (network byte order)
+        var groups = [UInt16]()
+        for i in stride(from: 0, to: 16, by: 2) {
+            groups.append(UInt16(bytes[bytes.startIndex + i]) << 8 | UInt16(bytes[bytes.startIndex + i + 1]))
+        }
+
+        // Find the longest run of consecutive zero groups for "::" compression (RFC 5952 §4.2.3)
+        var bestStart = -1, bestLen = 0
+        var curStart = -1, curLen = 0
+        for i in 0..<8 {
+            if groups[i] == 0 {
+                if curStart == -1 { curStart = i }
+                curLen += 1
+            } else {
+                if curLen > bestLen && curLen >= 2 {
+                    bestStart = curStart
+                    bestLen = curLen
+                }
+                curStart = -1
+                curLen = 0
+            }
+        }
+        if curLen > bestLen && curLen >= 2 {
+            bestStart = curStart
+            bestLen = curLen
+        }
+
+        // Build the string
+        var parts: [String] = []
+        var i = 0
+        while i < 8 {
+            if i == bestStart {
+                parts.append(i == 0 ? ":" : "")
+                i += bestLen
+                if i == 8 { parts.append("") }
+            } else {
+                parts.append(String(groups[i], radix: 16))
+                i += 1
+            }
+        }
+
+        return parts.joined(separator: ":")
     }
 }

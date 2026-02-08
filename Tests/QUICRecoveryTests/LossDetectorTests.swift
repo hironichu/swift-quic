@@ -609,16 +609,17 @@ struct LossDetectorTests {
 
         // This should complete quickly (within the 5 second time limit)
         // because we iterate over sentPackets (10 items), not the ACK range
-        let startTime = CFAbsoluteTimeGetCurrent()
+        let clock = ContinuousClock()
+        let startTime = clock.now
         let result = detector.onAckReceived(
             ackFrame: maliciousAck,
             ackReceivedTime: now + .milliseconds(10),
             rttEstimator: rttEstimator
         )
-        let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+        let elapsed = clock.now - startTime
 
         // Should complete in under 1 second (actually much faster)
-        #expect(elapsed < 1.0, "ACK processing took \(elapsed) seconds, expected < 1 second")
+        #expect(elapsed < .seconds(1), "ACK processing took \(elapsed), expected < 1 second")
 
         // All 10 packets should be acknowledged (they're within the range)
         #expect(result.ackedPackets.count == 10)

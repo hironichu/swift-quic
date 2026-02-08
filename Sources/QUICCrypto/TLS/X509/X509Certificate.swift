@@ -84,18 +84,27 @@ public struct X509Certificate: Sendable {
         Data(certificate.tbsCertificateBytes)
     }
 
-    /// The signature value
+    /// The signature value (DER-encoded for ECDSA, raw bytes for Ed25519)
+    ///
+    /// Extracted from the DER-encoded certificate structure:
+    /// ```
+    /// Certificate ::= SEQUENCE {
+    ///     tbsCertificate      TBSCertificate,
+    ///     signatureAlgorithm  AlgorithmIdentifier,
+    ///     signatureValue      BIT STRING
+    /// }
+    /// ```
     public var signatureValue: Data {
-        // Get the raw signature bytes from the certificate
-        // Re-serialize the full certificate and extract signature
-        var serializer = DER.Serializer()
         do {
-            try certificate.serialize(into: &serializer)
+            let certValue = try ASN1Parser.parseOne(from: derEncoded)
+            guard certValue.tag.isSequence, certValue.children.count >= 3 else {
+                return Data()
+            }
+            let (_, signatureBytes) = try certValue.children[2].asBitString()
+            return signatureBytes
         } catch {
             return Data()
         }
-        // For now, return empty - signature is available via certificate.signature
-        return Data()
     }
 
     // MARK: - Computed Properties
