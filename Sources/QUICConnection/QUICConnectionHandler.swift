@@ -113,6 +113,9 @@ public final class QUICConnectionHandler: Sendable {
         self.cryptoStreamManager = CryptoStreamManager()
 
         // Initialize stream manager with transport parameters
+        // Note: Peer limits default to our local limits until peer's transport parameters arrive.
+        // This allows streams to be opened during handshake (e.g., for 0-RTT or early data).
+        // These will be updated to actual peer limits in setPeerTransportParameters().
         self.streamManager = StreamManager(
             isClient: role == .client,
             initialMaxData: transportParameters.initialMaxData,
@@ -120,7 +123,13 @@ public final class QUICConnectionHandler: Sendable {
             initialMaxStreamDataBidiRemote: transportParameters.initialMaxStreamDataBidiRemote,
             initialMaxStreamDataUni: transportParameters.initialMaxStreamDataUni,
             initialMaxStreamsBidi: transportParameters.initialMaxStreamsBidi,
-            initialMaxStreamsUni: transportParameters.initialMaxStreamsUni
+            initialMaxStreamsUni: transportParameters.initialMaxStreamsUni,
+            peerInitialMaxData: transportParameters.initialMaxData,
+            peerInitialMaxStreamDataBidiLocal: transportParameters.initialMaxStreamDataBidiLocal,
+            peerInitialMaxStreamDataBidiRemote: transportParameters.initialMaxStreamDataBidiRemote,
+            peerInitialMaxStreamDataUni: transportParameters.initialMaxStreamDataUni,
+            peerInitialMaxStreamsBidi: transportParameters.initialMaxStreamsBidi,
+            peerInitialMaxStreamsUni: transportParameters.initialMaxStreamsUni
         )
 
         self.keySchedule = Mutex(KeySchedule())
@@ -427,13 +436,6 @@ public final class QUICConnectionHandler: Sendable {
         pnSpaceManager.handshakeConfirmed = true
     }
 
-    /// Gets peer transport parameters
-    ///
-    /// - Returns: Peer's transport parameters, or nil if not yet received
-    public func getPeerTransportParameters() -> TransportParameters? {
-        peerTransportParams.withLock { $0 }
-    }
-
     /// Sets peer transport parameters (called after TLS handshake)
     ///
     /// This updates various components with the peer's advertised limits and settings,
@@ -465,6 +467,13 @@ public final class QUICConnectionHandler: Sendable {
             bidiRemote: params.initialMaxStreamDataBidiRemote,
             uni: params.initialMaxStreamDataUni
         )
+    }
+
+    /// Gets peer transport parameters (if set)
+    ///
+    /// - Returns: Peer's transport parameters, or nil if not yet received
+    public func getPeerTransportParameters() -> TransportParameters? {
+        return peerTransportParams.withLock { $0 }
     }
 
     // MARK: - Key Management
