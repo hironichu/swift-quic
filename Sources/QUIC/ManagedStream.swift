@@ -21,7 +21,7 @@ public final class ManagedStream: @unchecked Sendable {
     /// Weak reference to parent connection
     private weak var connection: ManagedConnection?
 
-    /// Internal state
+    /// Internal state (includes read-side overflow buffer)
     private let state: Mutex<ManagedStreamState>
 
     // MARK: - Initialization
@@ -62,17 +62,46 @@ extension ManagedStream: QUICStreamProtocol {
             throw ManagedStreamError.streamClosed
         }
 
+        // Check for buffered overflow data first (from a previous read(maxBytes:) call)
+        let buffered = state.withLock { s -> Data? in
+            if !s.overflowBuffer.isEmpty {
+                let data = s.overflowBuffer
+                s.overflowBuffer = Data()
+                return data
+            }
+            return nil
+        }
+        if let buffered = buffered {
+            return buffered
+        }
+
         return try await conn.readFromStream(id)
     }
 
     public func read(maxBytes: Int) async throws -> Data {
         let data = try await read()
 
-        // Truncate if needed
-        if data.count > maxBytes {
-            return data.prefix(maxBytes)
+        // If data fits within maxBytes, return it as-is
+        if data.count <= maxBytes {
+            return data
         }
-        return data
+
+        // Otherwise, return the first maxBytes and buffer the rest
+        // so it is returned by the next read() call.
+        let result = data.prefix(maxBytes)
+        let overflow = data.dropFirst(maxBytes)
+
+        state.withLock { s in
+            // Prepend the overflow to any existing buffer (shouldn't normally
+            // have data, but be safe)
+            if s.overflowBuffer.isEmpty {
+                s.overflowBuffer = Data(overflow)
+            } else {
+                s.overflowBuffer = Data(overflow) + s.overflowBuffer
+            }
+        }
+
+        return Data(result)
     }
 
     public func write(_ data: Data) async throws {
@@ -128,6 +157,9 @@ extension ManagedStream: QUICStreamProtocol {
 private struct ManagedStreamState: Sendable {
     var readClosed: Bool = false
     var writeClosed: Bool = false
+    /// Excess bytes from a previous `read(maxBytes:)` call that were
+    /// truncated. Returned by the next `read()` invocation.
+    var overflowBuffer: Data = Data()
 }
 
 // MARK: - Errors

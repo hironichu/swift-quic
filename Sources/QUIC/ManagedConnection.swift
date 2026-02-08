@@ -1151,6 +1151,10 @@ extension ManagedConnection: QUICConnectionProtocol {
     /// This allows existing iterators to complete normally while preventing
     /// new iterators from hanging (they get an already-finished stream).
     public func shutdown() {
+        let scid = state.withLock { $0.sourceConnectionID }
+        print("[ManagedConnection] shutdown() called for SCID=\(scid)")
+        Thread.callStackSymbols.prefix(15).forEach { print("  [shutdown] \($0)") }
+
         // Finish incoming stream continuation and mark as shutdown
         // Guard against concurrent calls - finish() is idempotent but we avoid duplicate work
         incomingStreamState.withLock { state in
@@ -1185,6 +1189,7 @@ extension ManagedConnection: QUICConnectionProtocol {
         // Finish send signal stream to stop outboundSendLoop in QUICEndpoint
         state.withLock { s in
             guard !s.isSendSignalShutdown else { return }  // Already shutdown
+            print("[ManagedConnection] shutdown() finishing sendSignal for SCID=\(s.sourceConnectionID), hasContinuation=\(s.sendSignalContinuation != nil)")
             s.isSendSignalShutdown = true
             s.sendSignalContinuation?.finish()
             s.sendSignalContinuation = nil
@@ -1295,6 +1300,7 @@ extension ManagedConnection {
         state.withLock { s in
             // After shutdown, return an already-finished stream
             if s.isSendSignalShutdown {
+                print("[ManagedConnection] sendSignal accessed AFTER shutdown for SCID=\(s.sourceConnectionID)")
                 if let existing = s.sendSignalStream { return existing }
                 let (stream, continuation) = AsyncStream<Void>.makeStream(
                     bufferingPolicy: .bufferingNewest(1)
@@ -1305,7 +1311,10 @@ extension ManagedConnection {
             }
 
             // Return existing stream if already created (lazy initialization)
-            if let existing = s.sendSignalStream { return existing }
+            if let existing = s.sendSignalStream {
+                print("[ManagedConnection] sendSignal returning EXISTING stream for SCID=\(s.sourceConnectionID), hasContinuation=\(s.sendSignalContinuation != nil)")
+                return existing
+            }
 
             // Create new stream with bufferingNewest(1) for coalescing
             // Multiple yields before consumption result in only one signal
@@ -1314,6 +1323,7 @@ extension ManagedConnection {
             )
             s.sendSignalStream = stream
             s.sendSignalContinuation = continuation
+            print("[ManagedConnection] sendSignal CREATED new stream for SCID=\(s.sourceConnectionID)")
             return stream
         }
     }
@@ -1322,9 +1332,16 @@ extension ManagedConnection {
     ///
     /// Called after `writeToStream()` or `finishStream()` to trigger
     /// packet generation and transmission in QUICEndpoint.
-    private func signalNeedsSend() {
+    public func signalNeedsSend() {
         state.withLock { s in
-            guard !s.isSendSignalShutdown else { return }
+            guard !s.isSendSignalShutdown else {
+                print("[ManagedConnection] signalNeedsSend SKIPPED (shutdown) for SCID=\(s.sourceConnectionID)")
+                return
+            }
+            let hasContinuation = s.sendSignalContinuation != nil
+            if !hasContinuation {
+                print("[ManagedConnection] signalNeedsSend WARNING: no continuation for SCID=\(s.sourceConnectionID), streamExists=\(s.sendSignalStream != nil)")
+            }
             s.sendSignalContinuation?.yield(())
         }
     }

@@ -701,6 +701,7 @@ public actor QUICEndpoint {
             // No common version - close connection gracefully
             // RFC 9000: This isn't a protocol error, just an incompatibility
             await connection.close(error: nil)
+            print("[QUICEndpoint] UNREGISTER from handleVersionNegotiationPacket for SCID=\(connection.sourceConnectionID)")
             router.unregister(connection)
             timerManager.markClosed(connection)
         }
@@ -725,6 +726,7 @@ public actor QUICEndpoint {
             case .idleTimeout(let connection):
                 // Close connection due to idle timeout
                 await connection.close(error: nil)
+                print("[QUICEndpoint] UNREGISTER from processTimers idleTimeout for SCID=\(connection.sourceConnectionID)")
                 router.unregister(connection)
                 timerManager.markClosed(connection)
             }
@@ -934,8 +936,12 @@ public actor QUICEndpoint {
         sendSignal: AsyncStream<Void>,
         socket: any QUICSocket
     ) async {
+        print("[outboundSendLoop] STARTED for connection SCID=\(connection.sourceConnectionID)")
+        var iterationCount = 0
         for await _ in sendSignal {
-            guard !shouldStop else { break }
+            iterationCount += 1
+            print("[outboundSendLoop] signal #\(iterationCount) for SCID=\(connection.sourceConnectionID), shouldStop=\(shouldStop)")
+            guard !shouldStop else { print("[outboundSendLoop] breaking due to shouldStop"); break }
 
             do {
                 // Generate packets from pending stream data
@@ -962,8 +968,32 @@ public actor QUICEndpoint {
             }
         }
 
-        // Loop ended: connection closed or endpoint stopping
-        // Clean up connection from router and timer manager
+        // Loop ended: sendSignal was finished (connection closing or endpoint stopping).
+        // Flush any final queued packets — in particular the CONNECTION_CLOSE frame
+        // that handler.close() queued just before shutdown() finished the signal.
+        // Without this flush the peer never learns the connection was closed and
+        // keeps sending packets to a DCID that we are about to unregister.
+        do {
+            let finalPackets = try connection.generateOutboundPackets()
+            if !finalPackets.isEmpty {
+                print("[outboundSendLoop] Flushing \(finalPackets.count) final packets for SCID=\(connection.sourceConnectionID)")
+                for packet in finalPackets {
+                    let nioAddress = try connection.remoteAddress.toNIOAddress()
+                    try await socket.send(packet, to: nioAddress)
+                }
+            }
+        } catch {
+            // Best-effort — if we can't send the final packets, just log and proceed
+            logger.warning(
+                "Failed to flush final packets on connection close",
+                metadata: [
+                    "error": "\(error)",
+                    "remoteAddress": "\(connection.remoteAddress)"
+                ]
+            )
+        }
+
+        print("[outboundSendLoop] EXITED for connection SCID=\(connection.sourceConnectionID) after \(iterationCount) iterations, shouldStop=\(shouldStop)")
         router.unregister(connection)
         timerManager.markClosed(connection)
     }

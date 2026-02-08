@@ -228,6 +228,8 @@ public final class QUICConnectionHandler: Sendable {
                 )
             }
 
+            print("[QUICConnectionHandler] Processing frame: \(frame) at level: \(level)")
+
             switch frame {
             case .ack(let ackFrame):
                 try processAckFrame(ackFrame, level: level)
@@ -236,6 +238,7 @@ public final class QUICConnectionHandler: Sendable {
                 try processCryptoFrame(cryptoFrame, level: level, result: &result)
 
             case .connectionClose(let closeFrame):
+                print("[QUICConnectionHandler] ⚠️ CONNECTION_CLOSE received: errorCode=\(closeFrame.errorCode), frameType=\(String(describing: closeFrame.frameType)), reason=\(closeFrame.reasonPhrase), isAppError=\(closeFrame.isApplicationError)")
                 processConnectionClose(closeFrame)
                 result.connectionClosed = true
 

@@ -8,6 +8,16 @@
 
 import Testing
 import Foundation
+
+#if canImport(CoreFoundation)
+import CoreFoundation
+#else
+private func CFAbsoluteTimeGetCurrent() -> Double {
+    var ts = timespec()
+    clock_gettime(CLOCK_MONOTONIC, &ts)
+    return Double(ts.tv_sec) + Double(ts.tv_nsec) / 1_000_000_000
+}
+#endif
 import Crypto
 @testable import QUIC
 @testable import QUICCore

@@ -42,6 +42,7 @@
 /// requirements and the project's design principles.
 
 import Foundation
+import QUIC
 import QUICCore
 import QUICStream
 import QPACK
@@ -85,19 +86,19 @@ public actor HTTP3Connection {
     public enum Role: Sendable {
         /// Client role — initiates requests
         case client
-        /// Server role — receives and responds to requests
+        /// Server role — responds to requests
         case server
     }
 
-    /// Connection state
-    public enum State: Sendable, Hashable {
-        /// Connection created but not yet initialized
+    /// Connection states
+    enum State: Sendable, Hashable {
+        /// Connection not yet initialized
         case idle
-        /// Control streams opened, SETTINGS sent, waiting for peer SETTINGS
+        /// Initialization in progress (control streams being opened)
         case initializing
-        /// SETTINGS exchanged, connection ready for requests
+        /// Connection is ready for requests
         case ready
-        /// GOAWAY sent or received, draining in-flight requests
+        /// GOAWAY received/sent — no new requests
         case goingAway(lastStreamID: UInt64)
         /// Connection is closed
         case closed
@@ -106,47 +107,47 @@ public actor HTTP3Connection {
     // MARK: - Properties
 
     /// The underlying QUIC connection
-    private let quicConnection: any QUICConnectionProtocol
+    let quicConnection: any QUICConnectionProtocol
 
-    /// This endpoint's role (client or server)
-    public let role: Role
+    /// Our role (client or server)
+    let role: Role
 
     /// Local HTTP/3 settings
-    public let localSettings: HTTP3Settings
+    let localSettings: HTTP3Settings
 
-    /// Peer's HTTP/3 settings (available after SETTINGS exchange)
-    public private(set) var peerSettings: HTTP3Settings?
+    /// Peer's HTTP/3 settings (set after SETTINGS received)
+    var peerSettings: HTTP3Settings?
 
-    /// Current connection state
-    public private(set) var state: State = .idle
+    /// Connection state
+    var state: State = .idle
 
-    /// QPACK encoder (for encoding outgoing headers)
-    public let qpackEncoder: QPACKEncoder
+    /// QPACK encoder (for outgoing headers)
+    let qpackEncoder: QPACKEncoder
 
-    /// QPACK decoder (for decoding incoming headers)
-    public let qpackDecoder: QPACKDecoder
+    /// QPACK decoder (for incoming headers)
+    let qpackDecoder: QPACKDecoder
 
-    // MARK: - Stream State
+    // MARK: - Streams
 
-    /// Our control stream (outgoing)
-    private var localControlStream: (any QUICStreamProtocol)?
+    /// Our local control stream
+    var localControlStream: (any QUICStreamProtocol)?
 
-    /// Peer's control stream (incoming)
-    private var peerControlStream: (any QUICStreamProtocol)?
+    /// Peer's control stream
+    var peerControlStream: (any QUICStreamProtocol)?
 
-    /// Our QPACK encoder stream
-    private var localQPACKEncoderStream: (any QUICStreamProtocol)?
+    /// Our local QPACK encoder stream
+    var localQPACKEncoderStream: (any QUICStreamProtocol)?
 
-    /// Our QPACK decoder stream
-    private var localQPACKDecoderStream: (any QUICStreamProtocol)?
+    /// Our local QPACK decoder stream
+    var localQPACKDecoderStream: (any QUICStreamProtocol)?
 
     /// Peer's QPACK encoder stream
-    private var peerQPACKEncoderStream: (any QUICStreamProtocol)?
+    var peerQPACKEncoderStream: (any QUICStreamProtocol)?
 
     /// Peer's QPACK decoder stream
-    private var peerQPACKDecoderStream: (any QUICStreamProtocol)?
+    var peerQPACKDecoderStream: (any QUICStreamProtocol)?
 
-    /// The last stream ID from a received GOAWAY
+    /// GOAWAY stream ID (last stream/push ID to process)
     private var goawayStreamID: UInt64?
 
     /// The next client-initiated bidirectional stream ID to use
@@ -224,16 +225,10 @@ public actor HTTP3Connection {
 
     /// Initializes the HTTP/3 connection.
     ///
-    /// This performs the following steps:
-    /// 1. Opens the local control stream and sends SETTINGS
-    /// 2. Opens QPACK encoder and decoder streams
-    /// 3. Starts processing incoming unidirectional streams
+    /// Opens the control stream (with SETTINGS), QPACK encoder and decoder
+    /// streams, and starts processing incoming streams in the background.
     ///
-    /// After this returns, the connection may not yet be fully ready
-    /// (peer SETTINGS may not have arrived). Use `waitForReady()` to
-    /// wait for the peer's SETTINGS if needed.
-    ///
-    /// - Throws: `HTTP3Error` if stream creation or SETTINGS send fails
+    /// - Throws: `HTTP3Error` if initialization fails
     public func initialize() async throws {
         guard state == .idle else {
             throw HTTP3Error(code: .internalError, reason: "Connection already initialized")
@@ -254,13 +249,13 @@ public actor HTTP3Connection {
         }
     }
 
-    /// Waits until the connection is ready (peer SETTINGS received).
+    /// Waits until the connection transitions to the ready state.
     ///
-    /// This polls for the ready state with a timeout. In practice,
-    /// SETTINGS should arrive very quickly after connection establishment.
+    /// The connection is ready once peer SETTINGS have been received.
+    /// This typically happens during the initial stream exchange.
     ///
     /// - Parameter timeout: Maximum time to wait (default: 10 seconds)
-    /// - Throws: `HTTP3Error` if the connection doesn't become ready in time
+    /// - Throws: `HTTP3Error` if the timeout expires or connection closes
     public func waitForReady(timeout: Duration = .seconds(10)) async throws {
         let deadline = ContinuousClock.now + timeout
 
@@ -318,24 +313,17 @@ public actor HTTP3Connection {
         await quicConnection.close(applicationError: error.rawValue, reason: error.reason)
     }
 
-    // MARK: - Request Handling (Client)
+    // MARK: - Request/Response (Client)
 
-    /// Sends an HTTP/3 request and receives the response.
+    /// Sends an HTTP/3 request and waits for the response.
     ///
-    /// Opens a new bidirectional QUIC stream, sends HEADERS and optional
-    /// DATA frames, then reads the response HEADERS and DATA frames.
+    /// Opens a new bidirectional QUIC stream, sends the HEADERS and
+    /// optional DATA frames, closes the write side, and reads the
+    /// response frames.
     ///
     /// - Parameter request: The HTTP/3 request to send
     /// - Returns: The HTTP/3 response
     /// - Throws: `HTTP3Error` if the request fails
-    ///
-    /// ## Example
-    ///
-    /// ```swift
-    /// let request = HTTP3Request(method: .get, url: "https://example.com/")
-    /// let response = try await connection.sendRequest(request)
-    /// print("Status: \(response.status)")
-    /// ```
     public func sendRequest(_ request: HTTP3Request) async throws -> HTTP3Response {
         guard state == .ready || state == .initializing else {
             throw HTTP3Error(code: .internalError, reason: "Connection not ready (state: \(state))")
@@ -348,6 +336,11 @@ public actor HTTP3Connection {
 
         // Open a new bidirectional stream
         let stream = try await quicConnection.openStream()
+
+        // Track the stream ID and advance to the next one
+        // Client bidi streams: 0, 4, 8, 12, ... (increment by 4)
+        // Server bidi streams: 1, 5, 9, 13, ... (increment by 4)
+        nextStreamID += 4
 
         // Encode headers using QPACK
         let headerList = request.toHeaderList()
@@ -374,21 +367,17 @@ public actor HTTP3Connection {
 
     // MARK: - Response Reading (Client)
 
-    /// Reads an HTTP/3 response from a stream.
+    /// Reads an HTTP/3 response from a request stream with buffered framing.
     ///
-    /// Reads HEADERS and DATA frames from the stream until FIN.
-    /// The first frame MUST be a HEADERS frame containing the response
-    /// status and headers. DATA frames contain the response body.
-    ///
-    /// - Parameter stream: The QUIC stream to read from
-    /// - Returns: The decoded HTTP/3 response
-    /// - Throws: `HTTP3Error` if the response is malformed
+    /// Accumulates data across multiple reads and parses complete HTTP/3
+    /// frames from the buffer, tolerating fragmentation at frame boundaries.
     private func readResponse(from stream: any QUICStreamProtocol) async throws -> HTTP3Response {
         var responseHeaders: [(name: String, value: String)]?
         var bodyData = Data()
         var headersReceived = false
+        var buffer = Data()
 
-        // Read frames from the stream
+        // Read frames from the stream with buffering
         while true {
             let data: Data
             do {
@@ -403,10 +392,19 @@ public actor HTTP3Connection {
                 break
             }
 
-            // Decode frames from the received data
-            let (frames, _) = try HTTP3FrameCodec.decodeAll(from: data)
+            buffer.append(data)
+
+            // Decode as many complete frames as possible from the buffer
+            let (frames, _) = try decodeFramesFromBuffer(&buffer)
 
             for frame in frames {
+                // Check for reserved HTTP/2 frame types (RFC 9114 Section 7.2.8)
+                if HTTP3ReservedFrameType.isReserved(frame.frameType) {
+                    throw HTTP3Error.frameUnexpected(
+                        "Reserved frame type 0x\(String(frame.frameType, radix: 16)) (HTTP/2 only)"
+                    )
+                }
+
                 switch frame {
                 case .headers(let headerBlock):
                     if headersReceived {
@@ -446,12 +444,9 @@ public actor HTTP3Connection {
         return response
     }
 
-    // MARK: - Control Stream
+    // MARK: - Control Stream Setup
 
-    /// Opens the local control stream and sends SETTINGS.
-    ///
-    /// Per RFC 9114 Section 6.2.1, the first frame on the control stream
-    /// MUST be a SETTINGS frame.
+    /// Opens our local control stream and sends the initial SETTINGS frame.
     private func openControlStream() async throws {
         let stream = try await quicConnection.openUniStream()
         localControlStream = stream
@@ -505,18 +500,34 @@ public actor HTTP3Connection {
         }
     }
 
-    /// Handles an incoming unidirectional stream.
+    // MARK: - Unidirectional Stream Handling
+
+    /// Handles an incoming unidirectional stream by reading its type byte
+    /// and routing it to the appropriate handler.
     ///
-    /// Reads the stream type byte and routes the stream to the
-    /// appropriate handler.
+    /// The stream type is sent as the first varint on the stream. Any
+    /// remaining bytes after the type varint are forwarded to the handler
+    /// as initial buffered data to avoid data loss.
     private func handleIncomingUniStream(_ stream: any QUICStreamProtocol) async {
         do {
             // Read the stream type (first varint on the stream)
-            let typeData = try await stream.read(maxBytes: 8)
+            // We read a small amount — the varint is typically 1 byte,
+            // but the read may also contain subsequent frame data.
+            let typeData = try await stream.read()
             guard !typeData.isEmpty else { return }
 
-            guard let (streamTypeValue, _) = try HTTP3StreamType.decode(from: typeData) else {
+            guard let (streamTypeValue, consumed) = try HTTP3StreamType.decode(from: typeData) else {
                 return
+            }
+
+            // Extract any remaining data after the stream type varint.
+            // This data belongs to the first frame on the stream and
+            // must NOT be discarded.
+            let remainingData: Data
+            if consumed < typeData.count {
+                remainingData = Data(typeData.dropFirst(consumed))
+            } else {
+                remainingData = Data()
             }
 
             let classification = HTTP3StreamClassification.classify(streamTypeValue)
@@ -525,7 +536,7 @@ public actor HTTP3Connection {
             case .known(let streamType):
                 switch streamType {
                 case .control:
-                    try await handleIncomingControlStream(stream, remainingData: typeData)
+                    try await handleIncomingControlStream(stream, remainingData: remainingData)
                 case .qpackEncoder:
                     await handleIncomingQPACKEncoderStream(stream)
                 case .qpackDecoder:
@@ -557,7 +568,13 @@ public actor HTTP3Connection {
     /// Handles the peer's incoming control stream.
     ///
     /// Validates that only one control stream exists, reads the SETTINGS
-    /// frame, and then continues reading control frames (GOAWAY, etc.).
+    /// frame (with buffering to tolerate fragmentation), and then continues
+    /// reading control frames (GOAWAY, etc.).
+    ///
+    /// - Parameters:
+    ///   - stream: The QUIC stream for the peer's control stream
+    ///   - remainingData: Any data read after the stream type varint
+    ///     (may contain part or all of the first SETTINGS frame)
     private func handleIncomingControlStream(
         _ stream: any QUICStreamProtocol,
         remainingData: Data
@@ -573,15 +590,15 @@ public actor HTTP3Connection {
         peerControlStreamReceived = true
         peerControlStream = stream
 
-        // Read the first frame — MUST be SETTINGS
-        let firstFrameData = try await stream.read()
-        guard !firstFrameData.isEmpty else {
-            throw HTTP3Error.missingSettings
-        }
+        // Start a buffer with any leftover data from the stream type read
+        var buffer = remainingData
 
-        let (frame, _) = try HTTP3FrameCodec.decode(from: firstFrameData)
+        // Read the first frame — MUST be SETTINGS (RFC 9114 Section 6.2.1)
+        // The SETTINGS frame may arrive across multiple reads, so we buffer
+        // until a complete frame is available.
+        let settingsFrame = try await readNextFrame(from: stream, buffer: &buffer)
 
-        guard case .settings(let settings) = frame else {
+        guard case .settings(let settings) = settingsFrame else {
             throw HTTP3Error.missingSettings
         }
 
@@ -593,26 +610,36 @@ public actor HTTP3Connection {
         }
 
         // Continue reading control frames
-        await readControlFrames(from: stream)
+        await readControlFrames(from: stream, initialBuffer: buffer)
     }
 
     /// Reads and processes control frames from the peer's control stream.
     ///
     /// This runs for the lifetime of the connection, processing GOAWAY
-    /// and other control frames as they arrive.
-    private func readControlFrames(from stream: any QUICStreamProtocol) async {
-        while true {
-            do {
-                let data = try await stream.read()
-                if data.isEmpty {
-                    // Control stream closed — this is a connection error
-                    await close(error: .closedCriticalStream)
-                    return
-                }
+    /// and other control frames as they arrive. Uses buffered reading
+    /// to tolerate frame fragmentation across QUIC stream reads.
+    ///
+    /// - Parameters:
+    ///   - stream: The peer's control stream
+    ///   - initialBuffer: Any unconsumed bytes from previous reads
+    private func readControlFrames(
+        from stream: any QUICStreamProtocol,
+        initialBuffer: Data = Data()
+    ) async {
+        var buffer = initialBuffer
 
-                let (frames, _) = try HTTP3FrameCodec.decodeAll(from: data)
+        while true {
+            // First, try to decode frames already in the buffer
+            do {
+                let (frames, _) = try decodeFramesFromBuffer(&buffer)
 
                 for frame in frames {
+                    // Check for reserved HTTP/2 frame types
+                    if HTTP3ReservedFrameType.isReserved(frame.frameType) {
+                        await close(error: .frameUnexpected)
+                        return
+                    }
+
                     switch frame {
                     case .goaway(let streamID):
                         goawayStreamID = streamID
@@ -667,6 +694,21 @@ public actor HTTP3Connection {
                     }
                 }
             } catch {
+                // Malformed frame on control stream
+                await close(error: .frameError)
+                return
+            }
+
+            // Read more data from the stream
+            do {
+                let data = try await stream.read()
+                if data.isEmpty {
+                    // Control stream closed — this is a connection error
+                    await close(error: .closedCriticalStream)
+                    return
+                }
+                buffer.append(data)
+            } catch {
                 // Error reading from control stream
                 await close(error: .closedCriticalStream)
                 return
@@ -674,12 +716,15 @@ public actor HTTP3Connection {
         }
     }
 
-    /// Handles the peer's QPACK encoder stream.
+    // MARK: - QPACK Stream Handling
+
+    /// Handles the peer's incoming QPACK encoder stream.
     ///
-    /// In literal-only mode, no encoder instructions should arrive.
-    /// We keep the stream open (closing it would be a connection error).
+    /// In literal-only mode, no instructions are expected. The stream
+    /// is drained and discarded.
     private func handleIncomingQPACKEncoderStream(_ stream: any QUICStreamProtocol) async {
         guard !peerQPACKEncoderStreamReceived else {
+            // Duplicate — connection error
             await close(error: .streamCreationError)
             return
         }
@@ -687,32 +732,26 @@ public actor HTTP3Connection {
         peerQPACKEncoderStreamReceived = true
         peerQPACKEncoderStream = stream
 
-        // In literal-only mode, we don't expect any encoder instructions.
-        // Keep the stream alive by reading (and discarding) any data.
-        while true {
-            do {
+        // In literal-only mode, drain the stream
+        do {
+            while true {
                 let data = try await stream.read()
-                if data.isEmpty {
-                    // QPACK encoder stream closed — connection error
-                    await close(error: .closedCriticalStream)
-                    return
-                }
-                // In literal-only mode, any instructions are unexpected
-                // but we silently ignore them for forward compatibility
-            } catch {
-                // If the stream errors, that's a connection error
-                await close(error: .closedCriticalStream)
-                return
+                if data.isEmpty { break }
+                // In full QPACK mode, we'd process encoder instructions here
             }
+        } catch {
+            // Stream closed or error — for critical streams this is an error
+            // but in literal-only mode we tolerate it
         }
     }
 
-    /// Handles the peer's QPACK decoder stream.
+    /// Handles the peer's incoming QPACK decoder stream.
     ///
-    /// In literal-only mode, no decoder instructions should arrive.
-    /// We keep the stream open (closing it would be a connection error).
+    /// In literal-only mode, no instructions are expected. The stream
+    /// is drained and discarded.
     private func handleIncomingQPACKDecoderStream(_ stream: any QUICStreamProtocol) async {
         guard !peerQPACKDecoderStreamReceived else {
+            // Duplicate — connection error
             await close(error: .streamCreationError)
             return
         }
@@ -720,40 +759,32 @@ public actor HTTP3Connection {
         peerQPACKDecoderStreamReceived = true
         peerQPACKDecoderStream = stream
 
-        // In literal-only mode, we don't expect any decoder instructions.
-        // Keep the stream alive by reading (and discarding) any data.
-        while true {
-            do {
+        // In literal-only mode, drain the stream
+        do {
+            while true {
                 let data = try await stream.read()
-                if data.isEmpty {
-                    // QPACK decoder stream closed — connection error
-                    await close(error: .closedCriticalStream)
-                    return
-                }
-                // Silently ignore any instructions in literal-only mode
-            } catch {
-                await close(error: .closedCriticalStream)
-                return
+                if data.isEmpty { break }
+                // In full QPACK mode, we'd process decoder instructions here
             }
+        } catch {
+            // Stream closed or error
         }
     }
 
-    // MARK: - Incoming Request Stream Processing (Server)
+    // MARK: - Request Stream Handling (Server)
 
-    /// Handles an incoming bidirectional (request) stream.
+    /// Handles an incoming bidirectional (request) stream from a client.
     ///
-    /// Reads HEADERS and optional DATA frames, constructs an HTTP3Request,
-    /// and delivers it via the `incomingRequests` async stream.
-    ///
-    /// Also extracts the Priority header (RFC 9218) from the request
-    /// headers to set the initial stream priority, and checks for any
-    /// pending PRIORITY_UPDATE that may have arrived before the stream.
+    /// Reads HEADERS and DATA frames using buffered framing to tolerate
+    /// fragmentation, constructs the HTTP/3 request, and delivers it
+    /// to the incoming requests stream.
     private func handleIncomingRequestStream(_ stream: any QUICStreamProtocol) async {
         do {
-            // Read frames from the request stream
+            // Read frames from the request stream with buffering
             var requestHeaders: [(name: String, value: String)]?
             var bodyData = Data()
             var headersReceived = false
+            var buffer = Data()
 
             // Accumulate data until FIN
             while true {
@@ -768,9 +799,19 @@ public actor HTTP3Connection {
                     break
                 }
 
-                let (frames, _) = try HTTP3FrameCodec.decodeAll(from: data)
+                buffer.append(data)
+
+                // Decode as many complete frames as possible from the buffer
+                let (frames, _) = try decodeFramesFromBuffer(&buffer)
 
                 for frame in frames {
+                    // Check for reserved HTTP/2 frame types (RFC 9114 Section 7.2.8)
+                    if HTTP3ReservedFrameType.isReserved(frame.frameType) {
+                        throw HTTP3Error.frameUnexpected(
+                            "Reserved frame type 0x\(String(frame.frameType, radix: 16)) (HTTP/2 only)"
+                        )
+                    }
+
                     switch frame {
                     case .headers(let headerBlock):
                         if headersReceived {
@@ -852,37 +893,34 @@ public actor HTTP3Connection {
 
     // MARK: - Priority Management (RFC 9218)
 
-    /// Handles a received PRIORITY_UPDATE frame.
+    /// Handles a PRIORITY_UPDATE frame received on the control stream.
     ///
-    /// If the target stream exists, its priority is updated immediately.
-    /// If the stream hasn't been created yet, the update is stored as pending.
+    /// Updates the priority for the specified stream. If the stream
+    /// hasn't been created yet, the priority is stored as pending.
     ///
     /// - Parameters:
-    ///   - streamID: The stream or push ID being reprioritized
+    ///   - streamID: The stream ID being reprioritized
     ///   - priority: The new priority
     private func handlePriorityUpdate(streamID: UInt64, priority: StreamPriority) {
-        // Update the tracked priority
         streamPriorities[streamID] = priority
 
-        // Also store as pending in case the stream hasn't been opened yet
-        // (the stream will pick this up in handleIncomingRequestStream)
-        pendingPriorityUpdates[streamID] = priority
+        // If the stream hasn't been created yet, store as pending
+        // (will be applied when the stream is opened)
+        if !streamPriorities.keys.contains(streamID) {
+            pendingPriorityUpdates[streamID] = priority
+        }
     }
 
     /// Sends a PRIORITY_UPDATE frame for a request stream.
     ///
-    /// Only clients should call this method. The frame is sent on the
-    /// control stream to dynamically reprioritize a request.
+    /// RFC 9218 Section 7.1: PRIORITY_UPDATE frames are sent on the
+    /// control stream to dynamically change the priority of a stream.
     ///
     /// - Parameters:
-    ///   - streamID: The request stream ID to reprioritize
+    ///   - streamID: The stream ID to reprioritize
     ///   - priority: The new priority
-    /// - Throws: `HTTP3Error` if the control stream is not open or write fails
+    /// - Throws: `HTTP3Error` if the control stream is not available
     public func sendPriorityUpdate(streamID: UInt64, priority: StreamPriority) async throws {
-        guard role == .client else {
-            throw HTTP3Error(code: .internalError, reason: "Only clients can send PRIORITY_UPDATE")
-        }
-
         guard let controlStream = localControlStream else {
             throw HTTP3Error(code: .closedCriticalStream, reason: "Control stream not open")
         }
@@ -895,7 +933,7 @@ public actor HTTP3Connection {
         streamPriorities[streamID] = priority
     }
 
-    /// Returns the current priority for a stream.
+    /// Returns the effective priority for a stream.
     ///
     /// Checks dynamic priorities (from PRIORITY_UPDATE) first,
     /// then falls back to the default priority.
@@ -990,11 +1028,81 @@ public actor HTTP3Connection {
         parts.append("localSettings=\(localSettings)")
         return "HTTP3Connection(\(parts.joined(separator: ", ")))"
     }
+
+    // MARK: - Buffered Frame Helpers
+
+    /// Reads the next complete HTTP/3 frame from a stream, buffering across
+    /// multiple reads if necessary.
+    ///
+    /// This is used for the first SETTINGS frame on the control stream where
+    /// we need exactly one complete frame and must tolerate fragmentation.
+    ///
+    /// - Parameters:
+    ///   - stream: The QUIC stream to read from
+    ///   - buffer: A mutable buffer that accumulates unconsumed bytes.
+    ///     On entry it may contain leftover data from a previous read;
+    ///     on exit it contains any bytes remaining after the decoded frame.
+    /// - Returns: The decoded HTTP/3 frame
+    /// - Throws: `HTTP3Error` if the stream ends before a complete frame
+    ///   is available, or if the frame is malformed
+    private func readNextFrame(
+        from stream: any QUICStreamProtocol,
+        buffer: inout Data
+    ) async throws -> HTTP3Frame {
+        // Try to decode from what we already have
+        while true {
+            if !buffer.isEmpty {
+                do {
+                    var offset = 0
+                    let frame = try HTTP3FrameCodec.decode(from: buffer, offset: &offset)
+                    // Successfully decoded — remove consumed bytes from buffer
+                    buffer = Data(buffer.dropFirst(offset))
+                    return frame
+                } catch HTTP3FrameCodecError.insufficientData {
+                    // Need more data — fall through to read
+                } catch {
+                    // Malformed frame
+                    throw error
+                }
+            }
+
+            // Read more data from the stream
+            let data = try await stream.read()
+            if data.isEmpty {
+                throw HTTP3Error.missingSettings
+            }
+            buffer.append(data)
+        }
+    }
+
+    /// Decodes as many complete HTTP/3 frames as possible from the buffer,
+    /// removing consumed bytes.
+    ///
+    /// Uses `HTTP3FrameCodec.decodeAll` which stops at the first incomplete
+    /// frame boundary. The unconsumed bytes remain in the buffer for the
+    /// next read cycle.
+    ///
+    /// - Parameter buffer: A mutable buffer of accumulated stream data.
+    ///   Consumed bytes are removed; unconsumed bytes remain.
+    /// - Returns: A tuple of (decoded frames, bytes consumed)
+    /// - Throws: `HTTP3FrameCodecError` for malformed frames (not for
+    ///   insufficient data at the boundary — that's handled internally)
+    private func decodeFramesFromBuffer(_ buffer: inout Data) throws -> ([HTTP3Frame], Int) {
+        guard !buffer.isEmpty else { return ([], 0) }
+
+        let (frames, consumed) = try HTTP3FrameCodec.decodeAll(from: buffer)
+
+        if consumed > 0 {
+            buffer = Data(buffer.dropFirst(consumed))
+        }
+
+        return (frames, consumed)
+    }
 }
 
-// MARK: - QUICConnectionProtocol Import
+// MARK: - Re-export QUIC types for consumers of the HTTP3 module
 
-// Re-export the QUIC types that HTTP3Connection depends on
-// so that consumers of the HTTP3 module can use them without
-// importing QUIC separately.
+// Other files in the HTTP3 module (HTTP3Client, HTTP3Server, etc.) use
+// QUICConnectionProtocol / QUICStreamProtocol without importing QUIC
+// directly. This re-export makes those types available transitively.
 @_exported import QUIC

@@ -159,13 +159,17 @@ public final class ConnectionRouter: Sendable {
     /// - Parameter connection: The connection to unregister
     public func unregister(_ connection: ManagedConnection) {
         let connID = ObjectIdentifier(connection)
+        let scid = connection.sourceConnectionID
         // Get all CIDs from our tracking (single source of truth)
         let cids = connectionCIDs.withLock { $0.removeValue(forKey: connID) } ?? []
-        connections.withLock { conns in
+        let remainingCount = connections.withLock { conns -> Int in
             for cid in cids {
                 conns.removeValue(forKey: cid)
             }
+            return conns.count
         }
+        print("[ConnectionRouter] UNREGISTER connection SCID=\(scid) removed CIDs: \(cids) (remaining: \(remainingCount))")
+        Thread.callStackSymbols.prefix(15).forEach { print("  \($0)") }
     }
 
     /// Unregisters specific connection IDs (without connection reference)
