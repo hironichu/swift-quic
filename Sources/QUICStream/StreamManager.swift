@@ -224,6 +224,13 @@ public final class StreamManager: Sendable {
         state.withLock { $0.streams[streamID] != nil }
     }
 
+    /// Get a stream by ID
+    /// - Parameter streamID: The stream ID
+    /// - Returns: The DataStream if it exists, nil otherwise
+    public func getStream(streamID: UInt64) -> DataStream? {
+        state.withLock { $0.streams[streamID] }
+    }
+
     /// Close a stream
     /// - Parameter streamID: Stream to close
     public func closeStream(id streamID: UInt64) {

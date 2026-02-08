@@ -222,6 +222,15 @@ public final class DataStream: Sendable {
         _internal.withLock { $0.recvBuffer.contiguousBytesAvailable > 0 }
     }
 
+    /// Whether the stream has received FIN and all data has been read
+    public var isFullyRead: Bool {
+        _internal.withLock { `internal` in
+            `internal`.state.finReceived && 
+            `internal`.recvBuffer.isEmpty &&
+            `internal`.recvBuffer.isComplete
+        }
+    }
+
     /// Bytes buffered for reading
     public var bufferedReadBytes: Int {
         _internal.withLock { $0.recvBuffer.bufferedBytes }

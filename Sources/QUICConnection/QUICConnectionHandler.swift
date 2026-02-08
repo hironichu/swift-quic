@@ -262,6 +262,16 @@ public final class QUICConnectionHandler: Sendable {
                 if let data = streamManager.read(streamID: streamFrame.streamID) {
                     result.streamData.append((streamFrame.streamID, data))
                 }
+                
+                // If FIN was received and stream is fully read, notify with empty data
+                // This unblocks readers waiting for stream completion
+                if streamFrame.fin {
+                    if let stream = streamManager.getStream(streamID: streamFrame.streamID) {
+                        if stream.isFullyRead {
+                            result.streamData.append((streamFrame.streamID, Data()))
+                        }
+                    }
+                }
 
             case .resetStream(let resetFrame):
                 try streamManager.handleResetStream(resetFrame)

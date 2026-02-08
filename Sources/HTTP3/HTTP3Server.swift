@@ -317,9 +317,11 @@ public actor HTTP3Server {
             // Wait for QUIC handshake to complete before initializing HTTP/3
             // This ensures transport parameters are exchanged and streams can be opened
             try await waitForHandshakeComplete(quicConnection, timeout: .seconds(10))
-
+            
             // Initialize HTTP/3 (open control + QPACK streams, send SETTINGS)
+            print("[HTTP3Server] Calling h3Connection.initialize() for \(quicConnection.remoteAddress)")
             try await h3Connection.initialize()
+            print("[HTTP3Server] h3Connection.initialize() complete")
 
             // Process incoming requests
             for await context in await h3Connection.incomingRequests {
@@ -367,27 +369,42 @@ public actor HTTP3Server {
         _ connection: any QUICConnectionProtocol,
         timeout: Duration = .seconds(10)
     ) async throws {
+        print("[HTTP3Server] waitForHandshakeComplete STARTED")
+        
         // Ensure we have a ManagedConnection (fail fast if wrong type)
         guard let managedConn = connection as? ManagedConnection else {
+            print("[HTTP3Server] ERROR: Connection is not ManagedConnection!")
             throw HTTP3Error(
                 code: .internalError,
                 reason: "Connection must be a ManagedConnection to check handshake state"
             )
         }
         
+        print("[HTTP3Server] Initial handshake state: \(managedConn.handshakeState)")
+        
         let deadline = ContinuousClock.now + timeout
         
         // Poll with exponential backoff to reduce CPU usage
         var sleepDuration: Duration = .milliseconds(1)
         let maxSleep: Duration = .milliseconds(50)
+        var iterations = 0
         
         while ContinuousClock.now < deadline {
+            iterations += 1
+            
             // Check if handshake is complete
-            switch managedConn.handshakeState {
+            let currentState = managedConn.handshakeState
+            if iterations <= 5 || iterations % 20 == 0 {
+                print("[HTTP3Server] Polling handshake state (iteration \(iterations)): \(currentState)")
+            }
+            
+            switch currentState {
             case .established:
+                print("[HTTP3Server] Handshake established after \(iterations) iterations!")
                 return
                 
             case .closed, .closing:
+                print("[HTTP3Server] Connection closed/closing!")
                 throw HTTP3Error(
                     code: .internalError,
                     reason: "Connection closed before handshake completed"
@@ -405,6 +422,7 @@ public actor HTTP3Server {
             sleepDuration = min(sleepDuration * 2, maxSleep)
         }
         
+        print("[HTTP3Server] Handshake TIMEOUT after \(iterations) iterations, final state: \(managedConn.handshakeState)")
         throw HTTP3Error(
             code: .internalError,
             reason: "Handshake timeout - connection not established within \(timeout.components.seconds)s"

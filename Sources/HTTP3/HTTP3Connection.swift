@@ -491,18 +491,22 @@ public actor HTTP3Connection {
     /// Bidirectional streams are request streams. Unidirectional streams
     /// are classified by their stream type byte and routed accordingly.
     private func processIncomingStreams(from connection: any QUICConnectionProtocol) async {
+        print("[HTTP3Connection] processIncomingStreams STARTED for role=\(role)")
         for await stream in connection.incomingStreams {
+            print("[HTTP3Connection] Received incoming stream: \(stream.id), unidirectional=\(stream.isUnidirectional)")
             if stream.isUnidirectional {
                 Task { [weak self] in
                     await self?.handleIncomingUniStream(stream)
                 }
             } else {
                 // Bidirectional stream = request stream
+                print("[HTTP3Connection] Processing bidirectional stream \(stream.id) as request stream")
                 Task { [weak self] in
                     await self?.handleIncomingRequestStream(stream)
                 }
             }
         }
+        print("[HTTP3Connection] processIncomingStreams ENDED")
     }
 
     /// Handles an incoming unidirectional stream.
@@ -749,6 +753,7 @@ public actor HTTP3Connection {
     /// headers to set the initial stream priority, and checks for any
     /// pending PRIORITY_UPDATE that may have arrived before the stream.
     private func handleIncomingRequestStream(_ stream: any QUICStreamProtocol) async {
+        print("[HTTP3Connection] handleIncomingRequestStream STARTED for stream \(stream.id)")
         do {
             // Read frames from the request stream
             var requestHeaders: [(name: String, value: String)]?
@@ -760,15 +765,19 @@ public actor HTTP3Connection {
                 let data: Data
                 do {
                     data = try await stream.read()
+                    print("[HTTP3Connection] Read \(data.count) bytes from stream \(stream.id)")
                 } catch {
+                    print("[HTTP3Connection] Stream \(stream.id) read error: \(error)")
                     break
                 }
 
                 if data.isEmpty {
+                    print("[HTTP3Connection] Stream \(stream.id) received FIN")
                     break
                 }
 
                 let (frames, _) = try HTTP3FrameCodec.decodeAll(from: data)
+                print("[HTTP3Connection] Decoded \(frames.count) frames from stream \(stream.id)")
 
                 for frame in frames {
                     switch frame {
@@ -779,12 +788,14 @@ public actor HTTP3Connection {
                         }
                         requestHeaders = try qpackDecoder.decode(headerBlock)
                         headersReceived = true
+                        print("[HTTP3Connection] Stream \(stream.id) received HEADERS")
 
                     case .data(let payload):
                         guard headersReceived else {
                             throw HTTP3Error.frameUnexpected("DATA frame before HEADERS")
                         }
                         bodyData.append(payload)
+                        print("[HTTP3Connection] Stream \(stream.id) received DATA (\(payload.count) bytes)")
 
                     case .unknown:
                         // Ignore unknown frames
@@ -802,9 +813,12 @@ public actor HTTP3Connection {
 
             guard let headers = requestHeaders else {
                 // No HEADERS frame received — incomplete request
+                print("[HTTP3Connection] Stream \(stream.id) incomplete (no HEADERS), resetting")
                 await stream.reset(errorCode: HTTP3ErrorCode.requestIncomplete.rawValue)
                 return
             }
+
+            print("[HTTP3Connection] Stream \(stream.id) complete, yielding request to handler")
 
             // Extract Priority header (RFC 9218 Section 5.1)
             let priorityHeaderValue = headers.first(where: { $0.name.lowercased() == "priority" })?.value
@@ -843,9 +857,11 @@ public actor HTTP3Connection {
 
             // Deliver to the incoming requests stream
             incomingRequestsContinuation?.yield(context)
+            print("[HTTP3Connection] Stream \(stream.id) context yielded to incomingRequests")
 
         } catch {
             // Error processing request — reset the stream
+            print("[HTTP3Connection] Stream \(stream.id) error: \(error), resetting")
             await stream.reset(errorCode: HTTP3ErrorCode.messageError.rawValue)
         }
     }
