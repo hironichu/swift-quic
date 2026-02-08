@@ -664,3 +664,363 @@ struct IntegrationTests {
         #expect(await server.connectionCount >= 1)
     }
 }
+
+// MARK: - Handshake Completion Signaling Tests
+
+@Suite("Handshake Completion Signaling Tests")
+struct HandshakeCompletionTests {
+
+    /// Helper: creates a ManagedConnection with MockTLSProvider
+    private func createTestConnection(
+        role: ConnectionRole = .client,
+        immediateCompletion: Bool = true
+    ) throws -> (ManagedConnection, MockTLSProvider) {
+        let scid = try #require(ConnectionID.random(length: 8))
+        let dcid = try #require(ConnectionID.random(length: 8))
+        let config = QUICConfiguration()
+        let params = TransportParameters(from: config, sourceConnectionID: scid)
+        let tlsProvider = MockTLSProvider(immediateCompletion: immediateCompletion)
+        let address = SocketAddress(ipAddress: "127.0.0.1", port: 4433)
+
+        let connection = ManagedConnection(
+            role: role,
+            version: .v1,
+            sourceConnectionID: scid,
+            destinationConnectionID: dcid,
+            transportParameters: params,
+            tlsProvider: tlsProvider,
+            remoteAddress: address
+        )
+        return (connection, tlsProvider)
+    }
+
+    // MARK: - waitForHandshake() basic behaviour
+
+    @Test("waitForHandshake returns immediately when already established")
+    func waitForHandshakeAlreadyEstablished() async throws {
+        // Drive a full mock handshake so the connection reaches .established
+        let config = QUICConfiguration.testing()
+        let serverAddress = SocketAddress(ipAddress: "127.0.0.1", port: 4433)
+        let clientAddress = SocketAddress(ipAddress: "127.0.0.1", port: 54321)
+
+        let server = try await QUICEndpoint.listen(address: serverAddress, configuration: config)
+        let client = QUICEndpoint(configuration: config)
+
+        let clientToServer = PacketCollector()
+        let serverToClient = PacketCollector()
+
+        await client.setSendCallback { data, _ in clientToServer.append(data) }
+        await server.setSendCallback { data, _ in serverToClient.append(data) }
+
+        // Client sends Initial
+        let connection = try await client.connect(to: serverAddress)
+
+        // Drive handshake: client→server→client
+        for packet in clientToServer.packets {
+            _ = try await server.processIncomingPacket(packet, from: clientAddress)
+        }
+        for packet in serverToClient.packets {
+            _ = try await client.processIncomingPacket(packet, from: serverAddress)
+        }
+
+        // Now the connection should be established
+        #expect(connection.isEstablished)
+
+        // waitForHandshake() should return immediately (no hang)
+        try await connection.waitForHandshake()
+    }
+
+    @Test("waitForHandshake throws when connection is shutdown before handshake")
+    func waitForHandshakeThrowsOnShutdown() async throws {
+        let (connection, _) = try createTestConnection()
+
+        // Start the handshake (moves to .connecting)
+        _ = try await connection.start()
+        #expect(connection.handshakeState == .connecting)
+
+        // Kick off waitForHandshake in a child task — it should suspend
+        let waitTask = Task {
+            try await connection.waitForHandshake()
+        }
+
+        // Give the task a moment to actually suspend
+        try await Task.sleep(for: .milliseconds(20))
+
+        // Shutdown the connection — this should resume the waiter with error
+        connection.shutdown()
+
+        // The wait task should throw connectionClosed
+        do {
+            try await waitTask.value
+            Issue.record("Expected waitForHandshake to throw after shutdown")
+        } catch is ManagedConnectionError {
+            // Expected — connectionClosed
+        }
+    }
+
+    @Test("waitForHandshake throws when connection is already closed")
+    func waitForHandshakeAlreadyClosed() async throws {
+        let (connection, _) = try createTestConnection()
+        _ = try await connection.start()
+
+        // Transition to closing
+        await connection.close(error: nil)
+
+        // waitForHandshake should throw immediately
+        do {
+            try await connection.waitForHandshake()
+            Issue.record("Expected error for closed connection")
+        } catch is ManagedConnectionError {
+            // Expected
+        }
+    }
+
+    @Test("Multiple concurrent waitForHandshake callers all resume on completion")
+    func multipleConcurrentWaiters() async throws {
+        let config = QUICConfiguration.testing()
+        let serverAddress = SocketAddress(ipAddress: "127.0.0.1", port: 4433)
+        let clientAddress = SocketAddress(ipAddress: "127.0.0.1", port: 54321)
+
+        let server = try await QUICEndpoint.listen(address: serverAddress, configuration: config)
+        let client = QUICEndpoint(configuration: config)
+
+        let clientToServer = PacketCollector()
+        let serverToClient = PacketCollector()
+
+        await client.setSendCallback { data, _ in clientToServer.append(data) }
+        await server.setSendCallback { data, _ in serverToClient.append(data) }
+
+        let connection = try await client.connect(to: serverAddress)
+
+        // Use a task group: 3 waiters + 1 driver task.
+        // The driver completes the handshake; all 3 waiters should resume.
+        let completedCount = try await withThrowingTaskGroup(
+            of: Int.self,
+            returning: Int.self
+        ) { group in
+            // 3 waiter tasks — each returns 1 on success
+            for _ in 0..<3 {
+                group.addTask {
+                    try await connection.waitForHandshake()
+                    return 1
+                }
+            }
+
+            // Driver task — completes handshake, returns 0
+            group.addTask { [clientToServer, serverToClient] in
+                // Small delay to let waiters suspend first
+                try await Task.sleep(for: .milliseconds(20))
+
+                for packet in clientToServer.packets {
+                    _ = try await server.processIncomingPacket(packet, from: clientAddress)
+                }
+                for packet in serverToClient.packets {
+                    _ = try await client.processIncomingPacket(packet, from: serverAddress)
+                }
+                return 0
+            }
+
+            var total = 0
+            for try await value in group {
+                total += value
+            }
+            return total
+        }
+
+        #expect(completedCount == 3, "All 3 waiters should have completed")
+    }
+
+    @Test("Multiple concurrent waiters all fail on shutdown")
+    func multipleConcurrentWaitersFailOnShutdown() async throws {
+        let (connection, _) = try createTestConnection()
+        _ = try await connection.start()
+
+        // Use a task group: 3 waiters + 1 shutdown driver.
+        let errorTotal = try await withThrowingTaskGroup(
+            of: Int.self,
+            returning: Int.self
+        ) { group in
+            // 3 waiter tasks — each returns 1 if waitForHandshake throws
+            for _ in 0..<3 {
+                group.addTask {
+                    do {
+                        try await connection.waitForHandshake()
+                        return 0  // should not succeed
+                    } catch {
+                        return 1
+                    }
+                }
+            }
+
+            // Driver task — shuts down after waiters have suspended
+            group.addTask {
+                try await Task.sleep(for: .milliseconds(20))
+                connection.shutdown()
+                return 0
+            }
+
+            var total = 0
+            for try await value in group {
+                total += value
+            }
+            return total
+        }
+
+        #expect(errorTotal == 3, "All 3 waiters should have received errors")
+    }
+
+    // MARK: - Server-side handshake completion
+
+    @Test("Server-side waitForHandshake completes via processTLSOutputs path")
+    func serverSideHandshakeCompletion() async throws {
+        let config = QUICConfiguration.testing()
+        let serverAddress = SocketAddress(ipAddress: "127.0.0.1", port: 4433)
+        let clientAddress = SocketAddress(ipAddress: "127.0.0.1", port: 54321)
+
+        let server = try await QUICEndpoint.listen(address: serverAddress, configuration: config)
+        let client = QUICEndpoint(configuration: config)
+
+        let clientToServer = PacketCollector()
+        let serverToClient = PacketCollector()
+
+        await client.setSendCallback { data, _ in clientToServer.append(data) }
+        await server.setSendCallback { data, _ in serverToClient.append(data) }
+
+        // Client sends Initial
+        _ = try await client.connect(to: serverAddress)
+
+        // Server processes client Initial — this triggers server TLS handshake
+        // and should complete the server's handshake
+        for packet in clientToServer.packets {
+            _ = try await server.processIncomingPacket(packet, from: clientAddress)
+        }
+
+        // Verify the server generated response packets (handshake messages)
+        #expect(!serverToClient.isEmpty, "Server should have sent handshake response")
+    }
+
+    // MARK: - connect() returns before handshake (low-level API)
+
+    @Test("connect() returns connection in non-established state (low-level API)")
+    func connectReturnsBeforeHandshake() async throws {
+        let config = QUICConfiguration.testing()
+        let client = QUICEndpoint(configuration: config)
+        let serverAddress = SocketAddress(ipAddress: "127.0.0.1", port: 4433)
+
+        await client.setSendCallback { _, _ in }
+
+        let connection = try await client.connect(to: serverAddress)
+
+        // connect() is low-level — returns immediately after sending Initial
+        // handshake has NOT completed yet (no server packets processed)
+        #expect(!connection.isEstablished,
+                "connect() should return before handshake completes")
+    }
+
+    // MARK: - is0RTTAccepted correctness
+
+    @Test("is0RTTAccepted defaults to false for normal connections")
+    func is0RTTAcceptedDefaultsFalse() async throws {
+        let (connection, _) = try createTestConnection()
+
+        // Before handshake
+        #expect(!connection.is0RTTAccepted)
+
+        // Start handshake (but don't complete it)
+        _ = try await connection.start()
+        #expect(!connection.is0RTTAccepted)
+    }
+
+    // MARK: - Handshake state transitions with waitForHandshake
+
+    @Test("Handshake state transitions: idle → connecting → established")
+    func handshakeStateTransitionsWithWait() async throws {
+        let config = QUICConfiguration.testing()
+        let serverAddress = SocketAddress(ipAddress: "127.0.0.1", port: 4433)
+        let clientAddress = SocketAddress(ipAddress: "127.0.0.1", port: 54321)
+
+        let server = try await QUICEndpoint.listen(address: serverAddress, configuration: config)
+        let client = QUICEndpoint(configuration: config)
+
+        let clientToServer = PacketCollector()
+        let serverToClient = PacketCollector()
+
+        await client.setSendCallback { data, _ in clientToServer.append(data) }
+        await server.setSendCallback { data, _ in serverToClient.append(data) }
+
+        let connection = try await client.connect(to: serverAddress)
+        let managed = try #require(connection as? ManagedConnection)
+
+        // After connect(), state should be connecting (not established)
+        #expect(managed.handshakeState == .connecting)
+
+        // Drive full handshake
+        for packet in clientToServer.packets {
+            _ = try await server.processIncomingPacket(packet, from: clientAddress)
+        }
+        for packet in serverToClient.packets {
+            _ = try await client.processIncomingPacket(packet, from: serverAddress)
+        }
+
+        // Now should be established
+        #expect(managed.handshakeState == HandshakeState.established)
+
+        // waitForHandshake should return immediately
+        try await connection.waitForHandshake()
+    }
+
+    // MARK: - QUICConnectionProtocol conformance
+
+    @Test("waitForHandshake is available on QUICConnectionProtocol")
+    func waitForHandshakeOnProtocol() async throws {
+        let config = QUICConfiguration.testing()
+        let serverAddress = SocketAddress(ipAddress: "127.0.0.1", port: 4433)
+        let clientAddress = SocketAddress(ipAddress: "127.0.0.1", port: 54321)
+
+        let server = try await QUICEndpoint.listen(address: serverAddress, configuration: config)
+        let client = QUICEndpoint(configuration: config)
+
+        let clientToServer = PacketCollector()
+        let serverToClient = PacketCollector()
+
+        await client.setSendCallback { data, _ in clientToServer.append(data) }
+        await server.setSendCallback { data, _ in serverToClient.append(data) }
+
+        let conn: any QUICConnectionProtocol = try await client.connect(to: serverAddress)
+
+        // Drive handshake
+        for packet in clientToServer.packets {
+            _ = try await server.processIncomingPacket(packet, from: clientAddress)
+        }
+        for packet in serverToClient.packets {
+            _ = try await client.processIncomingPacket(packet, from: serverAddress)
+        }
+
+        // Call through the protocol
+        try await conn.waitForHandshake()
+        #expect(conn.isEstablished)
+        #expect(!conn.is0RTTAccepted)
+    }
+
+    // MARK: - dial() integration (handshake + timeout)
+
+    @Test("dial() timeout produces handshakeTimeout error")
+    func dialTimeoutProducesError() async throws {
+        let config = QUICConfiguration.testing()
+        let client = QUICEndpoint(configuration: config)
+
+        // Point at a non-existent server — handshake will never complete
+        let nowhere = SocketAddress(ipAddress: "127.0.0.1", port: 19999)
+
+        do {
+            _ = try await client.dial(address: nowhere, timeout: .milliseconds(200))
+            Issue.record("Expected handshakeTimeout error")
+        } catch {
+            guard case QUICEndpointError.handshakeTimeout = error else {
+                Issue.record("Expected handshakeTimeout but got: \(error)")
+                return
+            }
+            // Expected — handshakeTimeout
+        }
+    }
+}

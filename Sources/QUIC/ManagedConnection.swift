@@ -778,10 +778,24 @@ public final class ManagedConnection: Sendable {
                     signalNeedsSend()
                 }
 
-                // Mark handshake as established but don't discard keys yet
-                // We need to generate packets first
-                state.withLock { $0.handshakeState = .established }
+                // Mark handshake as established, drain waiters, and propagate 0-RTT result
+                let waiters = state.withLock { s -> [CheckedContinuation<Void, any Error>] in
+                    s.handshakeState = .established
+                    // Propagate actual 0-RTT acceptance from the TLS provider
+                    if s.is0RTTAttempted {
+                        s.is0RTTAccepted = self.tlsProvider.is0RTTAccepted
+                    }
+                    let w = s.handshakeCompletionContinuations
+                    s.handshakeCompletionContinuations.removeAll()
+                    return w
+                }
                 handshakeCompleted = true
+
+                // Resume all callers that are waiting in waitForHandshake()
+                // (server-side: handshake completes here via TLS output)
+                for waiter in waiters {
+                    waiter.resume()
+                }
 
             case .needMoreData:
                 // Wait for more data
@@ -835,10 +849,12 @@ public final class ManagedConnection: Sendable {
     /// - Server: Already discarded keys in processTLSOutputs()
     /// - Client: Discards keys here when HANDSHAKE_DONE is received
     private func completeHandshake() throws {
-        // Single lock acquisition to get role and update state
-        let role = state.withLock { s in
+        // Single lock acquisition to get role, update state, and drain waiters
+        let (role, waiters) = state.withLock { s -> (ConnectionRole, [CheckedContinuation<Void, any Error>]) in
             s.handshakeState = .established
-            return s.role
+            let w = s.handshakeCompletionContinuations
+            s.handshakeCompletionContinuations.removeAll()
+            return (s.role, w)
         }
 
         // Client discards keys when HANDSHAKE_DONE is received (RFC 9001 compliance)
@@ -852,6 +868,11 @@ public final class ManagedConnection: Sendable {
             handler.markHandshakeComplete()
         }
         // Server already discarded keys in processTLSOutputs()
+
+        // Resume all callers that are waiting in waitForHandshake()
+        for waiter in waiters {
+            waiter.resume()
+        }
     }
 
     /// Processes frame processing result (common logic for packet handling)
@@ -1191,8 +1212,19 @@ extension ManagedConnection: QUICConnectionProtocol {
     /// This allows existing iterators to complete normally while preventing
     /// new iterators from hanging (they get an already-finished stream).
     public func shutdown() {
-        let scid = state.withLock { $0.sourceConnectionID }
+        let (scid, handshakeWaiters) = state.withLock { s -> (ConnectionID, [CheckedContinuation<Void, any Error>]) in
+            let w = s.handshakeCompletionContinuations
+            s.handshakeCompletionContinuations.removeAll()
+            return (s.sourceConnectionID, w)
+        }
         Self.logger.info("shutdown() called for SCID=\(scid)")
+
+        // Resume any callers waiting in waitForHandshake() with an error
+        // This prevents them from hanging indefinitely when the connection
+        // is torn down before handshake completes.
+        for waiter in handshakeWaiters {
+            waiter.resume(throwing: ManagedConnectionError.connectionClosed)
+        }
 
         // Finish incoming stream continuation and mark as shutdown
         // Guard against concurrent calls - finish() is idempotent but we avoid duplicate work
@@ -1407,6 +1439,50 @@ extension ManagedConnection {
     /// authentication schemes (e.g., libp2p certificate-based PeerID extraction).
     public var underlyingTLSProvider: any TLS13Provider {
         tlsProvider
+    }
+
+    /// Whether 0-RTT early data was accepted by the server.
+    ///
+    /// Only meaningful after handshake completes. Before that, always `false`.
+    /// The value is propagated from the TLS provider's `is0RTTAccepted` once
+    /// the server's EncryptedExtensions has been processed.
+    public var is0RTTAccepted: Bool {
+        state.withLock { $0.is0RTTAccepted }
+    }
+
+    // MARK: - Handshake Completion
+
+    /// Suspends the caller until the QUIC handshake completes.
+    ///
+    /// - If the handshake is already complete (`.established`), returns
+    ///   immediately.
+    /// - If the connection is already closed/closing, throws
+    ///   ``ManagedConnectionError/connectionClosed``.
+    /// - Otherwise, the caller is suspended until one of the above
+    ///   conditions is reached.
+    ///
+    /// This replaces the previous poll-based `while !isEstablished` loop
+    /// in `QUICEndpoint.dial()` with an efficient continuation-based wait.
+    ///
+    /// ## Thread-Safety
+    /// Multiple concurrent callers are supported; all are resumed together
+    /// when the handshake completes.
+    public func waitForHandshake() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            state.withLock { s in
+                switch s.handshakeState {
+                case .established:
+                    // Already done — resume immediately
+                    continuation.resume()
+                case .closed, .closing:
+                    // Connection already torn down
+                    continuation.resume(throwing: ManagedConnectionError.connectionClosed)
+                default:
+                    // Handshake still in progress — park the continuation
+                    s.handshakeCompletionContinuations.append(continuation)
+                }
+            }
+        }
     }
 
     /// Source connection ID
@@ -1677,6 +1753,16 @@ private struct ManagedConnectionState: Sendable {
     /// Whether we have received and successfully processed any valid packet
     /// RFC 9000 Section 6.2: Used to discard late Version Negotiation packets
     var hasReceivedValidPacket: Bool = false
+
+    // MARK: - Handshake Completion Signaling
+
+    /// Continuations waiting for handshake completion.
+    ///
+    /// `waitForHandshake()` appends a `CheckedContinuation` here when the
+    /// handshake is still in progress.  Once the handshake completes (server:
+    /// `processTLSOutputs`, client: `completeHandshake`), or the connection
+    /// is closed/shut down, all pending continuations are resumed.
+    var handshakeCompletionContinuations: [CheckedContinuation<Void, any Error>] = []
 
     // MARK: - Retry State (RFC 9000 Section 8.1)
 

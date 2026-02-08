@@ -303,21 +303,35 @@ public actor QUICEndpoint {
             try await runPacketLoop(socket: socket)
         }
 
-        // Connect (this returns immediately, handshake not complete)
+        // connect() is the low-level API that returns immediately after
+        // sending the Initial packet. We then await handshake completion
+        // and race it against a timeout using a task group.
         let connection = try await connect(to: address)
 
-        // Wait for handshake completion with timeout
-        let deadline = ContinuousClock.now.advanced(by: timeout)
-        while !connection.isEstablished {
-            if ContinuousClock.now >= deadline {
-                runTask.cancel()
-                await socket.stop()
-                throw QUICEndpointError.handshakeTimeout
-            }
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                // Task 1: wait for handshake completion
+                group.addTask {
+                    try await connection.waitForHandshake()
+                }
 
-        return connection
+                // Task 2: timeout sentinel
+                group.addTask {
+                    try await Task.sleep(for: timeout)
+                    throw QUICEndpointError.handshakeTimeout
+                }
+
+                // First task to finish wins; cancel the other
+                try await group.next()
+                group.cancelAll()
+            }
+            return connection
+        } catch {
+            // On failure (timeout or connect error), tear down the I/O loop
+            runTask.cancel()
+            await socket.stop()
+            throw error
+        }
     }
 
     /// Connects to a remote QUIC server
@@ -385,8 +399,10 @@ public actor QUICEndpoint {
             try await send(packet, to: address)
         }
 
-        // Wait for handshake completion (simplified - in real impl, use packet loop)
-        // For now, return immediately and let the caller drive the packet loop
+        // Low-level API: return immediately after sending Initial packets.
+        // The caller is responsible for driving the packet loop and, if
+        // desired, calling connection.waitForHandshake() explicitly.
+        // The high-level dial() API handles this automatically.
 
         return connection
     }
@@ -445,6 +461,7 @@ public actor QUICEndpoint {
         } else {
             // No valid session for 0-RTT, fall back to regular connection
             let connection = try await connect(to: address)
+            try await connection.waitForHandshake()
             return (connection, false)
         }
     }
@@ -516,10 +533,10 @@ public actor QUICEndpoint {
             try await send(packet, to: address)
         }
 
-        // Wait for handshake to complete and check if 0-RTT was accepted
-        // For now, return optimistically - actual acceptance is determined later
-        // The caller should check connection.is0RTTAccepted after handshake completes
-        return (connection, true)
+        // Await handshake completion, then report actual 0-RTT acceptance
+        // from the TLS provider (set after EncryptedExtensions is processed).
+        try await connection.waitForHandshake()
+        return (connection, connection.is0RTTAccepted)
     }
 
     // MARK: - Packet Processing

@@ -18,6 +18,29 @@ public protocol QUICConnectionProtocol: Sendable {
     /// Whether the connection is established
     var isEstablished: Bool { get }
 
+    /// Whether 0-RTT early data was accepted by the server.
+    ///
+    /// Only meaningful after handshake completes. Before that, always `false`.
+    var is0RTTAccepted: Bool { get }
+
+    /// Suspends the caller until the QUIC handshake completes.
+    ///
+    /// - If the handshake is already complete, returns immediately.
+    /// - If the connection is closed before the handshake finishes, throws.
+    /// - Multiple concurrent callers are supported; all are resumed when
+    ///   the handshake completes (or fails).
+    ///
+    /// ## Usage
+    /// ```swift
+    /// let connection = try await endpoint.connect(to: serverAddress)
+    /// // connection is already established here — connect() awaits internally
+    ///
+    /// // But you can also call it explicitly if you obtained a connection
+    /// // through a lower-level API:
+    /// try await connection.waitForHandshake()
+    /// ```
+    func waitForHandshake() async throws
+
     /// Opens a new bidirectional stream
     func openStream() async throws -> any QUICStreamProtocol
 
