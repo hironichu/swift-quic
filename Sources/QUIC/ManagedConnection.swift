@@ -476,8 +476,11 @@ public final class ManagedConnection: Sendable {
         let responsePackets = try generateOutboundPackets()
         allOutbound.append(contentsOf: responsePackets)
 
+        print("[ManagedConnection] processDatagram returning \(allOutbound.count) total packets")
         // Apply anti-amplification limit to outbound packets (servers only)
-        return applyAmplificationLimit(to: allOutbound)
+        let limited = applyAmplificationLimit(to: allOutbound)
+        print("[ManagedConnection] After amplification limit: \(limited.count) packets")
+        return limited
     }
 
     /// Applies the anti-amplification limit to outbound packets
