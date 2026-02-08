@@ -182,10 +182,15 @@ public actor RequestStreamHandler {
             try await sendData(body)
         }
 
-        // 3. Close write side to signal end of request
+        // 3. Send trailers (if any) — RFC 9114 §4.1
+        if let trailers = request.trailers, !trailers.isEmpty {
+            try await sendHeaders(trailers)
+        }
+
+        // 4. Close write side to signal end of request
         try await stream.closeWrite()
 
-        // 4. Receive response
+        // 5. Receive response
         let response = try await receiveResponse()
         state = .complete
 
@@ -213,11 +218,12 @@ public actor RequestStreamHandler {
         // 2. Parse pseudo-headers into a request
         var request = try HTTP3Request.fromHeaderList(headerFields)
 
-        // 3. Read DATA frames (body) until FIN
-        let body = try await receiveBody()
+        // 3. Read DATA frames (body) and optional trailers until FIN
+        let (body, trailers) = try await receiveBody()
         if !body.isEmpty {
             request.body = body
         }
+        request.trailers = trailers
 
         state = .dataTransfer
         return request
@@ -248,7 +254,12 @@ public actor RequestStreamHandler {
             try await sendData(response.body)
         }
 
-        // 3. Close write side
+        // 3. Send trailers (if any) — RFC 9114 §4.1
+        if let trailers = response.trailers, !trailers.isEmpty {
+            try await sendHeaders(trailers)
+        }
+
+        // 4. Close write side
         try await stream.closeWrite()
         state = .complete
     }
@@ -337,8 +348,10 @@ public actor RequestStreamHandler {
         // 2. Parse into response
         var response = try HTTP3Response.fromHeaderList(headerFields)
 
-        // 3. Read body DATA frames
-        response.body = try await receiveBody()
+        // 3. Read body DATA frames and optional trailers
+        let (body, trailers) = try await receiveBody()
+        response.body = body
+        response.trailers = trailers
 
         return response
     }
@@ -353,8 +366,19 @@ public actor RequestStreamHandler {
     ///
     /// - Returns: The assembled body data (may be empty)
     /// - Throws: If reading fails or an unexpected frame type is received
-    private func receiveBody() async throws -> Data {
+    /// Receives all DATA frames until stream FIN, returning the assembled body
+    /// and any trailing HEADERS (trailers).
+    ///
+    /// Per RFC 9114 Section 4.1, an HTTP message on a request stream is:
+    ///   HEADERS (initial) + DATA* + HEADERS? (trailers)
+    ///
+    /// A trailing HEADERS frame is QPACK-decoded and validated to ensure
+    /// no pseudo-header fields are present (RFC 9114 §4.1.2).
+    ///
+    /// - Returns: Tuple of (body data, optional trailers)
+    private func receiveBody() async throws -> (body: Data, trailers: [(String, String)]?) {
         var body = Data()
+        var trailers: [(String, String)]?
 
         while true {
             // Try to read the next frame; if stream is done, break
@@ -366,10 +390,10 @@ public actor RequestStreamHandler {
             case .data(let chunk):
                 body.append(chunk)
 
-            case .headers:
-                // Trailing headers (trailers) — we acknowledge but skip for now
-                // A more complete implementation would parse and expose trailers
-                break
+            case .headers(let headerBlock):
+                // Trailing HEADERS frame (RFC 9114 §4.1)
+                let decoded = try decoder.decode(headerBlock)
+                trailers = try validateTrailers(decoded)
 
             case .unknown:
                 // Unknown frame types on request streams MUST be ignored
@@ -384,7 +408,7 @@ public actor RequestStreamHandler {
             }
         }
 
-        return body
+        return (body, trailers)
     }
 
     // MARK: - Frame Reading

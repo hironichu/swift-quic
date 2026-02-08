@@ -378,6 +378,14 @@ public actor HTTP3Connection {
             try await stream.write(dataData)
         }
 
+        // Send trailers (if any) — RFC 9114 §4.1
+        if let trailers = request.trailers, !trailers.isEmpty {
+            let encodedTrailers = qpackEncoder.encode(trailers)
+            let trailersFrame = HTTP3Frame.headers(encodedTrailers)
+            let trailersData = HTTP3FrameCodec.encode(trailersFrame)
+            try await stream.write(trailersData)
+        }
+
         // Close the write side (FIN)
         try await stream.closeWrite()
 
@@ -393,6 +401,7 @@ public actor HTTP3Connection {
     /// frames from the buffer, tolerating fragmentation at frame boundaries.
     private func readResponse(from stream: any QUICStreamProtocol) async throws -> HTTP3Response {
         var responseHeaders: [(name: String, value: String)]?
+        var responseTrailers: [(String, String)]?
         var bodyData = Data()
         var headersReceived = false
         var buffer = Data()
@@ -428,7 +437,9 @@ public actor HTTP3Connection {
                 switch frame {
                 case .headers(let headerBlock):
                     if headersReceived {
-                        // Trailers — we ignore them for now
+                        // Trailing HEADERS frame (RFC 9114 §4.1)
+                        let decoded = try qpackDecoder.decode(headerBlock)
+                        responseTrailers = try validateTrailers(decoded)
                         continue
                     }
                     responseHeaders = try qpackDecoder.decode(headerBlock)
@@ -461,6 +472,7 @@ public actor HTTP3Connection {
 
         var response = try HTTP3Response.fromHeaderList(headers)
         response.body = bodyData
+        response.trailers = responseTrailers
         return response
     }
 
@@ -823,6 +835,7 @@ public actor HTTP3Connection {
         do {
             // Read frames from the request stream with buffering
             var requestHeaders: [(name: String, value: String)]?
+            var requestTrailers: [(String, String)]?
             var bodyData = Data()
             var headersReceived = false
             var buffer = Data()
@@ -856,7 +869,9 @@ public actor HTTP3Connection {
                     switch frame {
                     case .headers(let headerBlock):
                         if headersReceived {
-                            // Trailers — skip for now
+                            // Trailing HEADERS frame (RFC 9114 §4.1)
+                            let decoded = try qpackDecoder.decode(headerBlock)
+                            requestTrailers = try validateTrailers(decoded)
                             continue
                         }
                         requestHeaders = try qpackDecoder.decode(headerBlock)
@@ -910,6 +925,7 @@ public actor HTTP3Connection {
             // Construct the request
             var request = try HTTP3Request.fromHeaderList(headers)
             request.body = bodyData.isEmpty ? nil : bodyData
+            request.trailers = requestTrailers
 
             // Create the response handler
             let respondClosure: @Sendable (HTTP3Response) async throws -> Void = { [weak self] response in
@@ -1019,6 +1035,14 @@ public actor HTTP3Connection {
                 let dataFrame = HTTP3Frame.data(response.body)
                 let dataData = HTTP3FrameCodec.encode(dataFrame)
                 try await stream.write(dataData)
+            }
+
+            // Send trailers (if any) — RFC 9114 §4.1
+            if let trailers = response.trailers, !trailers.isEmpty {
+                let encodedTrailers = qpackEncoder.encode(trailers)
+                let trailersFrame = HTTP3Frame.headers(encodedTrailers)
+                let trailersData = HTTP3FrameCodec.encode(trailersFrame)
+                try await stream.write(trailersData)
             }
 
             // Close the write side (FIN)

@@ -15,9 +15,28 @@
 /// - `:status` — HTTP status code as string ("200", "404", etc.)
 ///
 /// Pseudo-headers MUST appear before regular headers and
-/// MUST NOT appear in trailers.
+/// MUST NOT appear in trailers (RFC 9114 Section 4.1.2).
 
 import Foundation
+
+// MARK: - Trailer Validation
+
+/// Validates that a decoded trailer field section contains no pseudo-headers.
+///
+/// Per RFC 9114 Section 4.1.2, trailers MUST NOT contain pseudo-header
+/// fields. Any header whose name starts with `:` is a pseudo-header.
+///
+/// - Parameter fields: The decoded (name, value) pairs from a trailing HEADERS frame.
+/// - Returns: The validated fields (unchanged).
+/// - Throws: `HTTP3TypeError.pseudoHeaderInTrailers` if a pseudo-header is found.
+public func validateTrailers(_ fields: [(String, String)]) throws -> [(String, String)] {
+    for (name, _) in fields {
+        if name.hasPrefix(":") {
+            throw HTTP3TypeError.pseudoHeaderInTrailers(name)
+        }
+    }
+    return fields
+}
 
 // MARK: - HTTP Method
 
@@ -101,6 +120,15 @@ public struct HTTP3Request: Sendable, Hashable {
     /// Optional request body data
     public var body: Data?
 
+    /// Optional trailing header fields (trailers).
+    ///
+    /// Per RFC 9114 Section 4.1, an HTTP message may end with a
+    /// second HEADERS frame after all DATA frames. Trailers MUST NOT
+    /// contain pseudo-header fields (names starting with `:`).
+    ///
+    /// Common uses include `grpc-status` / `grpc-message` in gRPC.
+    public var trailers: [(String, String)]?
+
     /// Creates an HTTP/3 request from individual components.
     ///
     /// - Parameters:
@@ -110,13 +138,15 @@ public struct HTTP3Request: Sendable, Hashable {
     ///   - path: The request path (default: "/")
     ///   - headers: Regular header fields (default: empty)
     ///   - body: Optional request body (default: nil)
+    ///   - trailers: Optional trailing header fields (default: nil)
     public init(
         method: HTTPMethod = .get,
         scheme: String = "https",
         authority: String,
         path: String = "/",
         headers: [(String, String)] = [],
-        body: Data? = nil
+        body: Data? = nil,
+        trailers: [(String, String)]? = nil
     ) {
         self.method = method
         self.scheme = scheme
@@ -124,6 +154,7 @@ public struct HTTP3Request: Sendable, Hashable {
         self.path = path
         self.headers = headers
         self.body = body
+        self.trailers = trailers
     }
 
     /// Creates an HTTP/3 request from a URL string.
@@ -285,7 +316,11 @@ public struct HTTP3Request: Sendable, Hashable {
         lhs.path == rhs.path &&
         lhs.body == rhs.body &&
         lhs.headers.count == rhs.headers.count &&
-        zip(lhs.headers, rhs.headers).allSatisfy { $0.0 == $1.0 && $0.1 == $1.1 }
+        zip(lhs.headers, rhs.headers).allSatisfy { $0.0 == $1.0 && $0.1 == $1.1 } &&
+        lhs.trailers?.count == rhs.trailers?.count &&
+        (lhs.trailers == nil && rhs.trailers == nil ||
+         lhs.trailers != nil && rhs.trailers != nil &&
+         zip(lhs.trailers!, rhs.trailers!).allSatisfy { $0.0 == $1.0 && $0.1 == $1.1 })
     }
 
     public func hash(into hasher: inout Hasher) {
@@ -298,6 +333,13 @@ public struct HTTP3Request: Sendable, Hashable {
         for (name, value) in headers {
             hasher.combine(name)
             hasher.combine(value)
+        }
+        if let trailers = trailers {
+            hasher.combine(trailers.count)
+            for (name, value) in trailers {
+                hasher.combine(name)
+                hasher.combine(value)
+            }
         }
     }
 }
@@ -337,20 +379,30 @@ public struct HTTP3Response: Sendable, Hashable {
     /// The response body data
     public var body: Data
 
+    /// Optional trailing header fields (trailers).
+    ///
+    /// Per RFC 9114 Section 4.1, a response may end with a trailing
+    /// HEADERS frame after all DATA frames. Trailers MUST NOT contain
+    /// pseudo-header fields (names starting with `:`).
+    public var trailers: [(String, String)]?
+
     /// Creates an HTTP/3 response.
     ///
     /// - Parameters:
     ///   - status: The HTTP status code
     ///   - headers: Response header fields (default: empty)
     ///   - body: Response body data (default: empty)
+    ///   - trailers: Optional trailing header fields (default: nil)
     public init(
         status: Int,
         headers: [(String, String)] = [],
-        body: Data = Data()
+        body: Data = Data(),
+        trailers: [(String, String)]? = nil
     ) {
         self.status = status
         self.headers = headers
         self.body = body
+        self.trailers = trailers
     }
 
     /// The human-readable status text for common status codes.
@@ -489,7 +541,11 @@ public struct HTTP3Response: Sendable, Hashable {
         lhs.status == rhs.status &&
         lhs.body == rhs.body &&
         lhs.headers.count == rhs.headers.count &&
-        zip(lhs.headers, rhs.headers).allSatisfy { $0.0 == $1.0 && $0.1 == $1.1 }
+        zip(lhs.headers, rhs.headers).allSatisfy { $0.0 == $1.0 && $0.1 == $1.1 } &&
+        lhs.trailers?.count == rhs.trailers?.count &&
+        (lhs.trailers == nil && rhs.trailers == nil ||
+         lhs.trailers != nil && rhs.trailers != nil &&
+         zip(lhs.trailers!, rhs.trailers!).allSatisfy { $0.0 == $1.0 && $0.1 == $1.1 })
     }
 
     public func hash(into hasher: inout Hasher) {
@@ -499,6 +555,13 @@ public struct HTTP3Response: Sendable, Hashable {
         for (name, value) in headers {
             hasher.combine(name)
             hasher.combine(value)
+        }
+        if let trailers = trailers {
+            hasher.combine(trailers.count)
+            for (name, value) in trailers {
+                hasher.combine(name)
+                hasher.combine(value)
+            }
         }
     }
 }
@@ -589,6 +652,9 @@ public enum HTTP3TypeError: Error, Sendable, CustomStringConvertible {
     /// Pseudo-headers appeared after regular headers
     case pseudoHeaderAfterRegularHeader(String)
 
+    /// A pseudo-header appeared in a trailer section (RFC 9114 §4.1.2)
+    case pseudoHeaderInTrailers(String)
+
     public var description: String {
         switch self {
         case .missingPseudoHeader(let name):
@@ -601,6 +667,8 @@ public enum HTTP3TypeError: Error, Sendable, CustomStringConvertible {
             return "Unknown pseudo-header: \(name)"
         case .pseudoHeaderAfterRegularHeader(let name):
             return "Pseudo-header \(name) appeared after regular headers"
+        case .pseudoHeaderInTrailers(let name):
+            return "Pseudo-header \(name) is not allowed in trailers (RFC 9114 §4.1.2)"
         }
     }
 }

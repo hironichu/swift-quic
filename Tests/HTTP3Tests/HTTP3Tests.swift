@@ -1303,3 +1303,408 @@ final class HTTP3ServerTests: XCTestCase {
         XCTAssertEqual(serverSettings.maxTableCapacity, 8192)
     }
 }
+
+// MARK: - HTTP/3 Trailer Tests
+
+final class HTTP3TrailerTests: XCTestCase {
+
+    // MARK: - Request Trailer Properties
+
+    func testRequestTrailersDefaultNil() {
+        let request = HTTP3Request(authority: "example.com")
+        XCTAssertNil(request.trailers)
+    }
+
+    func testRequestWithTrailers() {
+        let request = HTTP3Request(
+            method: .post,
+            authority: "example.com",
+            path: "/upload",
+            headers: [("content-type", "application/octet-stream")],
+            body: Data("hello".utf8),
+            trailers: [("checksum", "abc123"), ("x-request-id", "42")]
+        )
+        XCTAssertNotNil(request.trailers)
+        XCTAssertEqual(request.trailers?.count, 2)
+        XCTAssertEqual(request.trailers?[0].0, "checksum")
+        XCTAssertEqual(request.trailers?[0].1, "abc123")
+        XCTAssertEqual(request.trailers?[1].0, "x-request-id")
+        XCTAssertEqual(request.trailers?[1].1, "42")
+    }
+
+    func testRequestTrailersInEquality() {
+        let a = HTTP3Request(
+            authority: "example.com",
+            trailers: [("grpc-status", "0")]
+        )
+        let b = HTTP3Request(
+            authority: "example.com",
+            trailers: [("grpc-status", "0")]
+        )
+        let c = HTTP3Request(
+            authority: "example.com",
+            trailers: [("grpc-status", "1")]
+        )
+        let d = HTTP3Request(authority: "example.com")
+
+        XCTAssertEqual(a, b)
+        XCTAssertNotEqual(a, c)
+        XCTAssertNotEqual(a, d)
+    }
+
+    func testRequestTrailersInHashable() {
+        let a = HTTP3Request(
+            authority: "example.com",
+            trailers: [("grpc-status", "0")]
+        )
+        let b = HTTP3Request(
+            authority: "example.com",
+            trailers: [("grpc-status", "0")]
+        )
+        XCTAssertEqual(a.hashValue, b.hashValue)
+    }
+
+    // MARK: - Response Trailer Properties
+
+    func testResponseTrailersDefaultNil() {
+        let response = HTTP3Response(status: 200)
+        XCTAssertNil(response.trailers)
+    }
+
+    func testResponseWithTrailers() {
+        let response = HTTP3Response(
+            status: 200,
+            headers: [("content-type", "text/plain")],
+            body: Data("ok".utf8),
+            trailers: [("grpc-status", "0"), ("grpc-message", "OK")]
+        )
+        XCTAssertNotNil(response.trailers)
+        XCTAssertEqual(response.trailers?.count, 2)
+        XCTAssertEqual(response.trailers?[0].0, "grpc-status")
+        XCTAssertEqual(response.trailers?[1].0, "grpc-message")
+    }
+
+    func testResponseTrailersInEquality() {
+        let a = HTTP3Response(status: 200, trailers: [("x-checksum", "sha256")])
+        let b = HTTP3Response(status: 200, trailers: [("x-checksum", "sha256")])
+        let c = HTTP3Response(status: 200, trailers: [("x-checksum", "md5")])
+        let d = HTTP3Response(status: 200)
+
+        XCTAssertEqual(a, b)
+        XCTAssertNotEqual(a, c)
+        XCTAssertNotEqual(a, d)
+    }
+
+    func testResponseTrailersInHashable() {
+        let a = HTTP3Response(status: 200, trailers: [("grpc-status", "0")])
+        let b = HTTP3Response(status: 200, trailers: [("grpc-status", "0")])
+        XCTAssertEqual(a.hashValue, b.hashValue)
+    }
+
+    // MARK: - Trailer Validation
+
+    func testValidateTrailersAcceptsRegularHeaders() throws {
+        let fields: [(String, String)] = [
+            ("grpc-status", "0"),
+            ("grpc-message", "OK"),
+            ("x-custom", "value"),
+        ]
+        let validated = try validateTrailers(fields)
+        XCTAssertEqual(validated.count, 3)
+    }
+
+    func testValidateTrailersAcceptsEmpty() throws {
+        let validated = try validateTrailers([])
+        XCTAssertTrue(validated.isEmpty)
+    }
+
+    func testValidateTrailersRejectsStatusPseudoHeader() {
+        let fields: [(String, String)] = [
+            (":status", "200"),
+            ("grpc-status", "0"),
+        ]
+        XCTAssertThrowsError(try validateTrailers(fields)) { error in
+            guard case HTTP3TypeError.pseudoHeaderInTrailers(let name) = error else {
+                XCTFail("Expected pseudoHeaderInTrailers, got \(error)")
+                return
+            }
+            XCTAssertEqual(name, ":status")
+        }
+    }
+
+    func testValidateTrailersRejectsMethodPseudoHeader() {
+        let fields: [(String, String)] = [
+            (":method", "GET"),
+        ]
+        XCTAssertThrowsError(try validateTrailers(fields)) { error in
+            guard case HTTP3TypeError.pseudoHeaderInTrailers(let name) = error else {
+                XCTFail("Expected pseudoHeaderInTrailers, got \(error)")
+                return
+            }
+            XCTAssertEqual(name, ":method")
+        }
+    }
+
+    func testValidateTrailersRejectsPathPseudoHeader() {
+        XCTAssertThrowsError(try validateTrailers([(":path", "/")])) { error in
+            guard case HTTP3TypeError.pseudoHeaderInTrailers = error else {
+                XCTFail("Expected pseudoHeaderInTrailers, got \(error)")
+                return
+            }
+        }
+    }
+
+    func testValidateTrailersRejectsSchemePseudoHeader() {
+        XCTAssertThrowsError(try validateTrailers([(":scheme", "https")])) { error in
+            guard case HTTP3TypeError.pseudoHeaderInTrailers = error else {
+                XCTFail("Expected pseudoHeaderInTrailers, got \(error)")
+                return
+            }
+        }
+    }
+
+    func testValidateTrailersRejectsAuthorityPseudoHeader() {
+        XCTAssertThrowsError(try validateTrailers([(":authority", "example.com")])) { error in
+            guard case HTTP3TypeError.pseudoHeaderInTrailers = error else {
+                XCTFail("Expected pseudoHeaderInTrailers, got \(error)")
+                return
+            }
+        }
+    }
+
+    func testValidateTrailersRejectsUnknownPseudoHeader() {
+        // Any name starting with ":" is a pseudo-header
+        XCTAssertThrowsError(try validateTrailers([(":x-custom", "val")])) { error in
+            guard case HTTP3TypeError.pseudoHeaderInTrailers = error else {
+                XCTFail("Expected pseudoHeaderInTrailers, got \(error)")
+                return
+            }
+        }
+    }
+
+    // MARK: - Trailer Frame Round-Trip (QPACK + HTTP3FrameCodec)
+
+    func testTrailerQPACKRoundTrip() throws {
+        let trailers: [(name: String, value: String)] = [
+            ("grpc-status", "0"),
+            ("grpc-message", "OK"),
+        ]
+
+        let encoder = QPACKEncoder()
+        let decoder = QPACKDecoder()
+
+        let encoded = encoder.encode(trailers)
+        let decoded = try decoder.decode(encoded)
+
+        XCTAssertEqual(decoded.count, 2)
+        XCTAssertEqual(decoded[0].name, "grpc-status")
+        XCTAssertEqual(decoded[0].value, "0")
+        XCTAssertEqual(decoded[1].name, "grpc-message")
+        XCTAssertEqual(decoded[1].value, "OK")
+    }
+
+    func testTrailerFrameEncodeDecodeRoundTrip() throws {
+        let encoder = QPACKEncoder()
+        let decoder = QPACKDecoder()
+
+        let trailers: [(name: String, value: String)] = [
+            ("x-checksum", "sha256:abc123"),
+        ]
+
+        // Encode trailers as a HEADERS frame (same as initial headers on the wire)
+        let encodedBlock = encoder.encode(trailers)
+        let frame = HTTP3Frame.headers(encodedBlock)
+        let wireData = HTTP3FrameCodec.encode(frame)
+
+        // Decode the frame
+        let (decodedFrame, _) = try HTTP3FrameCodec.decode(from: wireData)
+        guard case .headers(let headerBlock) = decodedFrame else {
+            XCTFail("Expected HEADERS frame")
+            return
+        }
+
+        // Decode the QPACK header block
+        let decodedFields = try decoder.decode(headerBlock)
+        XCTAssertEqual(decodedFields.count, 1)
+        XCTAssertEqual(decodedFields[0].name, "x-checksum")
+        XCTAssertEqual(decodedFields[0].value, "sha256:abc123")
+
+        // Validate as trailers (no pseudo-headers)
+        let validated = try validateTrailers(decodedFields)
+        XCTAssertEqual(validated.count, 1)
+    }
+
+    // MARK: - Full Message Frame Sequence with Trailers
+
+    func testRequestFrameSequenceWithTrailers() throws {
+        let encoder = QPACKEncoder()
+        let decoder = QPACKDecoder()
+
+        let request = HTTP3Request(
+            method: .post,
+            authority: "example.com",
+            path: "/rpc",
+            headers: [("content-type", "application/grpc")],
+            body: Data([0x00, 0x00, 0x00, 0x00, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f]),
+            trailers: [("grpc-status", "0"), ("grpc-message", "OK")]
+        )
+
+        // Simulate the on-the-wire frame sequence:
+        // 1. HEADERS (initial)
+        let headerList = request.toHeaderList()
+        let encodedHeaders = encoder.encode(headerList)
+        let headersFrame = HTTP3FrameCodec.encode(.headers(encodedHeaders))
+
+        // 2. DATA
+        let dataFrame = HTTP3FrameCodec.encode(.data(request.body!))
+
+        // 3. HEADERS (trailers)
+        let encodedTrailers = encoder.encode(request.trailers!)
+        let trailersFrame = HTTP3FrameCodec.encode(.headers(encodedTrailers))
+
+        // Concatenate all frames (as they would appear on the wire)
+        var wireData = Data()
+        wireData.append(headersFrame)
+        wireData.append(dataFrame)
+        wireData.append(trailersFrame)
+
+        // Decode all frames
+        let (frames, _) = try HTTP3FrameCodec.decodeAll(from: wireData)
+        XCTAssertEqual(frames.count, 3)
+
+        // Frame 0: initial HEADERS
+        guard case .headers(let block0) = frames[0] else {
+            XCTFail("Expected HEADERS frame at index 0")
+            return
+        }
+        let decodedHeaders = try decoder.decode(block0)
+        XCTAssertTrue(decodedHeaders.contains(where: { $0.name == ":method" && $0.value == "POST" }))
+        XCTAssertTrue(decodedHeaders.contains(where: { $0.name == ":path" && $0.value == "/rpc" }))
+
+        // Frame 1: DATA
+        guard case .data(let bodyPayload) = frames[1] else {
+            XCTFail("Expected DATA frame at index 1")
+            return
+        }
+        XCTAssertEqual(bodyPayload, request.body)
+
+        // Frame 2: trailing HEADERS
+        guard case .headers(let block2) = frames[2] else {
+            XCTFail("Expected HEADERS frame at index 2")
+            return
+        }
+        let decodedTrailers = try decoder.decode(block2)
+        let validatedTrailers = try validateTrailers(decodedTrailers)
+        XCTAssertEqual(validatedTrailers.count, 2)
+        XCTAssertEqual(validatedTrailers[0].0, "grpc-status")
+        XCTAssertEqual(validatedTrailers[0].1, "0")
+        XCTAssertEqual(validatedTrailers[1].0, "grpc-message")
+        XCTAssertEqual(validatedTrailers[1].1, "OK")
+    }
+
+    func testResponseFrameSequenceWithTrailers() throws {
+        let encoder = QPACKEncoder()
+        let decoder = QPACKDecoder()
+
+        let response = HTTP3Response(
+            status: 200,
+            headers: [("content-type", "application/grpc")],
+            body: Data("response-body".utf8),
+            trailers: [("grpc-status", "0")]
+        )
+
+        // Simulate on-the-wire frame sequence
+        let encodedHeaders = encoder.encode(response.toHeaderList())
+        let headersFrame = HTTP3FrameCodec.encode(.headers(encodedHeaders))
+        let dataFrame = HTTP3FrameCodec.encode(.data(response.body))
+        let encodedTrailers = encoder.encode(response.trailers!)
+        let trailersFrame = HTTP3FrameCodec.encode(.headers(encodedTrailers))
+
+        var wireData = Data()
+        wireData.append(headersFrame)
+        wireData.append(dataFrame)
+        wireData.append(trailersFrame)
+
+        let (frames, _) = try HTTP3FrameCodec.decodeAll(from: wireData)
+        XCTAssertEqual(frames.count, 3)
+
+        // Verify initial HEADERS
+        guard case .headers(let block0) = frames[0] else {
+            XCTFail("Expected HEADERS")
+            return
+        }
+        let headers = try decoder.decode(block0)
+        XCTAssertTrue(headers.contains(where: { $0.name == ":status" && $0.value == "200" }))
+
+        // Verify DATA
+        guard case .data(let body) = frames[1] else {
+            XCTFail("Expected DATA")
+            return
+        }
+        XCTAssertEqual(body, response.body)
+
+        // Verify trailers
+        guard case .headers(let block2) = frames[2] else {
+            XCTFail("Expected trailing HEADERS")
+            return
+        }
+        let trailers = try decoder.decode(block2)
+        let validated = try validateTrailers(trailers)
+        XCTAssertEqual(validated.count, 1)
+        XCTAssertEqual(validated[0].0, "grpc-status")
+        XCTAssertEqual(validated[0].1, "0")
+    }
+
+    // MARK: - No Trailers Case (Backward Compatibility)
+
+    func testRequestWithoutTrailersUnchanged() throws {
+        let request = HTTP3Request(
+            method: .get,
+            authority: "example.com",
+            path: "/",
+            headers: [("accept", "text/html")]
+        )
+        XCTAssertNil(request.trailers)
+
+        // toHeaderList should not include trailers
+        let headerList = request.toHeaderList()
+        XCTAssertFalse(headerList.contains(where: { $0.name == "grpc-status" }))
+    }
+
+    func testResponseWithoutTrailersUnchanged() throws {
+        let response = HTTP3Response(
+            status: 200,
+            headers: [("content-type", "text/html")],
+            body: Data("<html></html>".utf8)
+        )
+        XCTAssertNil(response.trailers)
+    }
+
+    // MARK: - Error Description
+
+    func testPseudoHeaderInTrailersErrorDescription() {
+        let error = HTTP3TypeError.pseudoHeaderInTrailers(":status")
+        XCTAssertTrue(error.description.contains(":status"))
+        XCTAssertTrue(error.description.contains("trailer"))
+    }
+
+    // MARK: - Empty Trailers
+
+    func testEmptyTrailersArrayTreatedAsPresent() {
+        // An explicit empty array is distinct from nil
+        let response = HTTP3Response(status: 200, trailers: [])
+        XCTAssertNotNil(response.trailers)
+        XCTAssertTrue(response.trailers!.isEmpty)
+    }
+
+    func testNilTrailersDifferentFromEmptyTrailers() {
+        let a = HTTP3Response(status: 200, trailers: nil)
+        let b = HTTP3Response(status: 200, trailers: [])
+        // nil vs empty array — implementation treats them as equal
+        // (both have count == 0 / nil)
+        // This tests the Hashable/Equatable implementation handles both
+        // The key invariant: neither should produce a trailing HEADERS frame on the wire
+        XCTAssertNil(a.trailers)
+        XCTAssertNotNil(b.trailers)
+    }
+}

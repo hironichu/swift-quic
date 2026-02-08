@@ -779,7 +779,7 @@ public final class ManagedConnection: Sendable {
                 }
 
                 // Mark handshake as established, drain waiters, and propagate 0-RTT result
-                let waiters = state.withLock { s -> [CheckedContinuation<Void, any Error>] in
+                let waiters = state.withLock { s -> [(id: UUID, continuation: CheckedContinuation<Void, any Error>)] in
                     s.handshakeState = .established
                     // Propagate actual 0-RTT acceptance from the TLS provider
                     if s.is0RTTAttempted {
@@ -794,7 +794,7 @@ public final class ManagedConnection: Sendable {
                 // Resume all callers that are waiting in waitForHandshake()
                 // (server-side: handshake completes here via TLS output)
                 for waiter in waiters {
-                    waiter.resume()
+                    waiter.continuation.resume()
                 }
 
             case .needMoreData:
@@ -850,7 +850,7 @@ public final class ManagedConnection: Sendable {
     /// - Client: Discards keys here when HANDSHAKE_DONE is received
     private func completeHandshake() throws {
         // Single lock acquisition to get role, update state, and drain waiters
-        let (role, waiters) = state.withLock { s -> (ConnectionRole, [CheckedContinuation<Void, any Error>]) in
+        let (role, waiters) = state.withLock { s -> (ConnectionRole, [(id: UUID, continuation: CheckedContinuation<Void, any Error>)]) in
             s.handshakeState = .established
             let w = s.handshakeCompletionContinuations
             s.handshakeCompletionContinuations.removeAll()
@@ -871,7 +871,7 @@ public final class ManagedConnection: Sendable {
 
         // Resume all callers that are waiting in waitForHandshake()
         for waiter in waiters {
-            waiter.resume()
+            waiter.continuation.resume()
         }
     }
 
@@ -1212,7 +1212,7 @@ extension ManagedConnection: QUICConnectionProtocol {
     /// This allows existing iterators to complete normally while preventing
     /// new iterators from hanging (they get an already-finished stream).
     public func shutdown() {
-        let (scid, handshakeWaiters) = state.withLock { s -> (ConnectionID, [CheckedContinuation<Void, any Error>]) in
+        let (scid, handshakeWaiters) = state.withLock { s -> (ConnectionID, [(id: UUID, continuation: CheckedContinuation<Void, any Error>)]) in
             let w = s.handshakeCompletionContinuations
             s.handshakeCompletionContinuations.removeAll()
             return (s.sourceConnectionID, w)
@@ -1223,7 +1223,7 @@ extension ManagedConnection: QUICConnectionProtocol {
         // This prevents them from hanging indefinitely when the connection
         // is torn down before handshake completes.
         for waiter in handshakeWaiters {
-            waiter.resume(throwing: ManagedConnectionError.connectionClosed)
+            waiter.continuation.resume(throwing: ManagedConnectionError.connectionClosed)
         }
 
         // Finish incoming stream continuation and mark as shutdown
@@ -1468,20 +1468,46 @@ extension ManagedConnection {
     /// Multiple concurrent callers are supported; all are resumed together
     /// when the handshake completes.
     public func waitForHandshake() async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-            state.withLock { s in
-                switch s.handshakeState {
-                case .established:
-                    // Already done — resume immediately
-                    continuation.resume()
-                case .closed, .closing:
-                    // Connection already torn down
-                    continuation.resume(throwing: ManagedConnectionError.connectionClosed)
-                default:
-                    // Handshake still in progress — park the continuation
-                    s.handshakeCompletionContinuations.append(continuation)
+        // We need a stable identity so the cancellation handler can
+        // locate and remove the exact continuation that was parked.
+        let id = UUID()
+
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                state.withLock { s in
+                    // Re-check cancellation under the lock so we never
+                    // park a continuation that is already doomed.
+                    if Task.isCancelled {
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
+
+                    switch s.handshakeState {
+                    case .established:
+                        // Already done — resume immediately
+                        continuation.resume()
+                    case .closed, .closing:
+                        // Connection already torn down
+                        continuation.resume(throwing: ManagedConnectionError.connectionClosed)
+                    default:
+                        // Handshake still in progress — park the continuation
+                        s.handshakeCompletionContinuations.append((id: id, continuation: continuation))
+                    }
                 }
             }
+        } onCancel: {
+            // Task was cancelled (e.g. dial() timeout).
+            // Remove our continuation from the list and resume it with
+            // CancellationError so the structured-concurrency task group
+            // can finish instead of hanging forever.
+            let removed: CheckedContinuation<Void, any Error>? = state.withLock { s in
+                if let idx = s.handshakeCompletionContinuations.firstIndex(where: { $0.id == id }) {
+                    let entry = s.handshakeCompletionContinuations.remove(at: idx)
+                    return entry.continuation
+                }
+                return nil
+            }
+            removed?.resume(throwing: CancellationError())
         }
     }
 
@@ -1758,11 +1784,14 @@ private struct ManagedConnectionState: Sendable {
 
     /// Continuations waiting for handshake completion.
     ///
-    /// `waitForHandshake()` appends a `CheckedContinuation` here when the
-    /// handshake is still in progress.  Once the handshake completes (server:
-    /// `processTLSOutputs`, client: `completeHandshake`), or the connection
-    /// is closed/shut down, all pending continuations are resumed.
-    var handshakeCompletionContinuations: [CheckedContinuation<Void, any Error>] = []
+    /// `waitForHandshake()` appends an `(id, continuation)` pair here when
+    /// the handshake is still in progress.  The `id` allows the
+    /// cancellation handler to locate and remove a specific entry.
+    ///
+    /// Once the handshake completes (server: `processTLSOutputs`, client:
+    /// `completeHandshake`), or the connection is closed/shut down, all
+    /// pending continuations are resumed.
+    var handshakeCompletionContinuations: [(id: UUID, continuation: CheckedContinuation<Void, any Error>)] = []
 
     // MARK: - Retry State (RFC 9000 Section 8.1)
 
