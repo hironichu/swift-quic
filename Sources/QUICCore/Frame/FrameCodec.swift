@@ -3,6 +3,7 @@
 /// Provides encoding and decoding for all QUIC frame types.
 
 import Foundation
+import Logging
 
 // MARK: - Frame Codec Errors
 
@@ -57,6 +58,7 @@ public protocol FrameDecoder: Sendable {
 /// - 関数呼び出しオーバーヘッドを削減し、さらなるコンパイラ最適化を有効化
 /// - 特に小さなフレーム（PING, ACK）で効果的
 public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
+    private static let logger = Logger(label: "quic.core.frame-codec")
 
     @inlinable
     public init() {}
@@ -266,8 +268,8 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         if stream.hasLength { typeByte |= 0x02 }   // LEN bit
         if stream.fin { typeByte |= 0x01 }         // FIN bit
 
-        print("[FrameCodec] Encoding STREAM frame: streamID=\(stream.streamID), offset=\(stream.offset), dataLen=\(stream.data.count), fin=\(stream.fin), hasLength=\(stream.hasLength)")
-        print("[FrameCodec] Type byte: 0x\(String(format: "%02X", typeByte)) (OFF=\(hasOffset), LEN=\(stream.hasLength), FIN=\(stream.fin))")
+        Self.logger.trace("Encoding STREAM frame: streamID=\(stream.streamID), offset=\(stream.offset), dataLen=\(stream.data.count), fin=\(stream.fin), hasLength=\(stream.hasLength)")
+        Self.logger.trace("Type byte: 0x\(String(format: "%02X", typeByte)) (OFF=\(hasOffset), LEN=\(stream.hasLength), FIN=\(stream.fin))")
 
         let startSize = writer.count
 
@@ -288,7 +290,7 @@ public struct StandardFrameCodec: FrameEncoder, FrameDecoder, Sendable {
         writer.writeBytes(stream.data)
 
         let frameSize = writer.count - startSize
-        print("[FrameCodec] STREAM frame encoded: \(frameSize) bytes total")
+        Self.logger.trace("STREAM frame encoded: \(frameSize) bytes total")
     }
 
     /// CONNECTION_CLOSEフレームのエンコード

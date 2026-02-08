@@ -70,6 +70,7 @@
 // =============================================================================
 
 import Foundation
+import Logging
 import QUIC
 import QUICCore
 import QUICTransport
@@ -101,6 +102,24 @@ struct DemoArguments {
     let mode: Mode
     let host: String
     let port: UInt16
+    let logLevel: Logger.Level
+
+    /// Parses a string into a `Logger.Level`.
+    ///
+    /// Accepted values (case-insensitive):
+    ///   trace, debug, info, notice, warning, error, critical
+    static func parseLogLevel(_ string: String) -> Logger.Level? {
+        switch string.lowercased() {
+        case "trace":    return .trace
+        case "debug":    return .debug
+        case "info":     return .info
+        case "notice":   return .notice
+        case "warning":  return .warning
+        case "error":    return .error
+        case "critical": return .critical
+        default:         return nil
+        }
+    }
 
     static func parse() -> DemoArguments {
         let args = CommandLine.arguments
@@ -108,6 +127,7 @@ struct DemoArguments {
         var mode: Mode = .help
         var host = defaultHost
         var port = defaultPort
+        var logLevel: Logger.Level = .info
 
         var i = 1
         while i < args.count {
@@ -124,13 +144,21 @@ struct DemoArguments {
             case "--port", "-p":
                 i += 1
                 if i < args.count { port = UInt16(args[i]) ?? defaultPort }
+            case "--log-level", "-l":
+                i += 1
+                if i < args.count, let level = parseLogLevel(args[i]) {
+                    logLevel = level
+                } else {
+                    print("Warning: Invalid log level '\(i < args.count ? args[i] : "")', using 'info'")
+                    print("  Valid levels: trace, debug, info, notice, warning, error, critical")
+                }
             default:
                 break
             }
             i += 1
         }
 
-        return DemoArguments(mode: mode, host: host, port: port)
+        return DemoArguments(mode: mode, host: host, port: port, logLevel: logLevel)
     }
 }
 
@@ -1153,8 +1181,10 @@ func printHelp() {
         help        Show this help message
 
     OPTIONS:
-        --host <address>    Host address (default: \(defaultHost))
-        --port, -p <port>   Port number (default: \(defaultPort))
+        --host <address>        Host address (default: \(defaultHost))
+        --port, -p <port>       Port number (default: \(defaultPort))
+        --log-level, -l <level> Log verbosity (default: info)
+                                Levels: trace, debug, info, notice, warning, error, critical
 
     EXAMPLES:
         # Start the HTTP/3 server
@@ -1168,6 +1198,15 @@ func printHelp() {
 
         # Connect to a custom address
         swift run HTTP3Demo client --host 192.168.1.10 --port 8443
+
+        # Enable verbose logging (see all QUIC/HTTP3 internals)
+        swift run HTTP3Demo server --log-level trace
+
+        # Show only warnings and errors
+        swift run HTTP3Demo server -l warning
+
+        # Debug level (connection lifecycle, stream events)
+        swift run HTTP3Demo client --log-level debug
 
     HTTP/3 PROTOCOL OVERVIEW:
 
@@ -1264,6 +1303,14 @@ func printHelp() {
 // MARK: - Entry Point
 
 let arguments = DemoArguments.parse()
+
+// Bootstrap swift-log with the requested log level.
+// This MUST be called once before any Logger is used.
+LoggingSystem.bootstrap { label in
+    var handler = StreamLogHandler.standardOutput(label: label)
+    handler.logLevel = arguments.logLevel
+    return handler
+}
 
 switch arguments.mode {
 case .server:

@@ -5,6 +5,7 @@
 /// and TLS handshake coordination.
 
 import Foundation
+import Logging
 import Synchronization
 import QUICCore
 import QUICRecovery
@@ -36,6 +37,7 @@ public enum QUICConnectionHandlerError: Error, Sendable {
 /// - TLS handshake coordination
 /// - Key schedule management
 public final class QUICConnectionHandler: Sendable {
+    private static let logger = Logger(label: "quic.connection.handler")
     // MARK: - Properties
 
     /// Connection state
@@ -228,7 +230,7 @@ public final class QUICConnectionHandler: Sendable {
                 )
             }
 
-            print("[QUICConnectionHandler] Processing frame: \(frame) at level: \(level)")
+            Self.logger.trace("Processing frame: \(frame) at level: \(level)")
 
             switch frame {
             case .ack(let ackFrame):
@@ -238,12 +240,12 @@ public final class QUICConnectionHandler: Sendable {
                 try processCryptoFrame(cryptoFrame, level: level, result: &result)
 
             case .connectionClose(let closeFrame):
-                print("[QUICConnectionHandler] ⚠️ CONNECTION_CLOSE received: errorCode=\(closeFrame.errorCode), frameType=\(String(describing: closeFrame.frameType)), reason=\(closeFrame.reasonPhrase), isAppError=\(closeFrame.isApplicationError)")
+                Self.logger.warning("CONNECTION_CLOSE received: errorCode=\(closeFrame.errorCode), frameType=\(String(describing: closeFrame.frameType)), reason=\(closeFrame.reasonPhrase), isAppError=\(closeFrame.isApplicationError)")
                 processConnectionClose(closeFrame)
                 result.connectionClosed = true
 
             case .handshakeDone:
-                print("[QUICConnectionHandler] Received HANDSHAKE_DONE frame")
+                Self.logger.debug("Received HANDSHAKE_DONE frame")
                 processHandshakeDone()
                 result.handshakeComplete = true
 
@@ -251,26 +253,26 @@ public final class QUICConnectionHandler: Sendable {
                 // Check if this is a new peer-initiated stream
                 let isNewStream = !streamManager.hasStream(id: streamFrame.streamID)
                 let isRemote = isRemoteStream(streamFrame.streamID)
-                print("[QUICConnectionHandler] STREAM frame: streamID=\(streamFrame.streamID), isNew=\(isNewStream), isRemote=\(isRemote), dataLen=\(streamFrame.data.count), fin=\(streamFrame.fin)")
+                Self.logger.trace("STREAM frame: streamID=\(streamFrame.streamID), isNew=\(isNewStream), isRemote=\(isRemote), dataLen=\(streamFrame.data.count), fin=\(streamFrame.fin)")
 
                 try streamManager.receive(frame: streamFrame)
 
                 // Track new peer-initiated streams
                 if isNewStream {
                     if isRemote {
-                        print("[QUICConnectionHandler] Adding streamID=\(streamFrame.streamID) to newStreams")
+                        Self.logger.debug("Adding streamID=\(streamFrame.streamID) to newStreams")
                         result.newStreams.append(streamFrame.streamID)
                     } else {
-                        print("[QUICConnectionHandler] Skipping streamID=\(streamFrame.streamID) - locally initiated")
+                        Self.logger.trace("Skipping streamID=\(streamFrame.streamID) - locally initiated")
                     }
                 }
 
                 // Read available data from the stream
                 if let data = streamManager.read(streamID: streamFrame.streamID) {
-                    print("[QUICConnectionHandler] Read \(data.count) bytes from stream \(streamFrame.streamID)")
+                    Self.logger.trace("Read \(data.count) bytes from stream \(streamFrame.streamID)")
                     result.streamData.append((streamFrame.streamID, data))
                 } else {
-                    print("[QUICConnectionHandler] No data available from stream \(streamFrame.streamID) after receive")
+                    Self.logger.trace("No data available from stream \(streamFrame.streamID) after receive")
                 }
 
                 // Check if the stream's receive side is now complete (FIN
@@ -278,7 +280,7 @@ public final class QUICConnectionHandler: Sendable {
                 // allows ManagedConnection to resume any blocked reader with
                 // an end-of-stream signal instead of letting it hang forever.
                 if streamManager.isStreamReceiveComplete(streamID: streamFrame.streamID) {
-                    print("[QUICConnectionHandler] Stream \(streamFrame.streamID) receive complete (FIN)")
+                    Self.logger.debug("Stream \(streamFrame.streamID) receive complete (FIN)")
                     result.finishedStreams.append(streamFrame.streamID)
                 }
 
@@ -322,7 +324,7 @@ public final class QUICConnectionHandler: Sendable {
                 result.pathResponseData.append(data)
 
             case .newConnectionID(let frame):
-                print("[QUICConnectionHandler] Received NEW_CONNECTION_ID: CID=\(frame.connectionID), seq=\(frame.sequenceNumber), retirePriorTo=\(frame.retirePriorTo)")
+                Self.logger.debug("Received NEW_CONNECTION_ID: CID=\(frame.connectionID), seq=\(frame.sequenceNumber), retirePriorTo=\(frame.retirePriorTo)")
                 // Process using ConnectionIDManager
                 // RFC 9000 §5.1.1: Validates duplicate sequence numbers and limit
                 try connectionIDManager.handleNewConnectionID(frame)
@@ -440,7 +442,7 @@ public final class QUICConnectionHandler: Sendable {
     ///
     /// This enables stream frame generation in getOutboundPackets().
     public func markHandshakeComplete() {
-        print("[QUICConnectionHandler] Marking handshake complete")
+        Self.logger.info("Marking handshake complete")
         handshakeComplete.withLock { $0 = true }
         connectionState.withLock { $0.status = .established }
         pnSpaceManager.handshakeConfirmed = true
@@ -586,7 +588,7 @@ public final class QUICConnectionHandler: Sendable {
         if handshakeComplete.withLock({ $0 }) {
             let streamFrames = streamManager.generateStreamFrames(maxBytes: 1200)
             if !streamFrames.isEmpty {
-                print("[QUICConnectionHandler] Generated \(streamFrames.count) stream frames")
+                Self.logger.trace("Generated \(streamFrames.count) stream frames")
             }
             for streamFrame in streamFrames {
                 queueFrame(.stream(streamFrame), level: .application)
@@ -598,7 +600,7 @@ public final class QUICConnectionHandler: Sendable {
                 queueFrame(flowFrame, level: .application)
             }
         } else {
-            print("[QUICConnectionHandler] Handshake not complete, skipping stream frame generation")
+            Self.logger.trace("Handshake not complete, skipping stream frame generation")
         }
 
         // Get queued packets
@@ -620,7 +622,7 @@ public final class QUICConnectionHandler: Sendable {
     /// Queues CRYPTO frames to be sent
     public func queueCryptoData(_ data: Data, level: EncryptionLevel) {
         let frames = cryptoStreamManager.createFrames(for: data, at: level)
-        print("[QUICConnectionHandler] Queueing \(frames.count) CRYPTO frames (\(data.count) bytes) at \(level)")
+        Self.logger.debug("Queueing \(frames.count) CRYPTO frames (\(data.count) bytes) at \(level)")
         for frame in frames {
             queueFrame(.crypto(frame), level: level)
         }

@@ -6,6 +6,7 @@
 /// - Header protection application/removal
 
 import Foundation
+import Logging
 
 // MARK: - Packet Codec Errors
 
@@ -336,6 +337,7 @@ public struct PacketEncoder: Sendable {
 
 /// Decodes QUIC packets
 public struct PacketDecoder: Sendable {
+    private static let logger = Logger(label: "quic.core.packet-codec")
     private let frameCodec: StandardFrameCodec
 
     public init() {
@@ -363,10 +365,10 @@ public struct PacketDecoder: Sendable {
         let isLongHeader = (firstByte & 0x80) != 0
 
         if isLongHeader {
-            print("[PacketDecoder] Decoding Long Header packet (firstByte: 0x\(String(format: "%02X", firstByte)))")
+            Self.logger.trace("Decoding Long Header packet (firstByte: 0x\(String(format: "%02X", firstByte)))")
             return try decodeLongHeaderPacket(data: data, opener: opener, largestPN: largestPN)
         } else {
-            print("[PacketDecoder] Decoding Short Header packet (1-RTT) (firstByte: 0x\(String(format: "%02X", firstByte)))")
+            Self.logger.trace("Decoding Short Header packet (1-RTT) (firstByte: 0x\(String(format: "%02X", firstByte)))")
             return try decodeShortHeaderPacket(data: data, dcidLength: dcidLength, opener: opener, largestPN: largestPN)
         }
     }

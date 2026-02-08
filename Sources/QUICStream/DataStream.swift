@@ -3,6 +3,7 @@
 /// Manages a single QUIC stream with send/receive buffers and state tracking.
 
 import Foundation
+import Logging
 import Synchronization
 import QUICCore
 
@@ -73,6 +74,7 @@ private struct DataStreamInternalState: Sendable {
 /// Bidirectional streams have both send and receive sides.
 /// Unidirectional streams have only one side active.
 public final class DataStream: Sendable {
+    private static let logger = Logger(label: "quic.stream.data")
     /// Stream identifier
     public let id: UInt64
 
@@ -409,7 +411,7 @@ public final class DataStream: Sendable {
             let sendMaxData = `internal`.state.sendMaxData
             let sendOffset = `internal`.state.sendOffset
             let availableWindow = sendMaxData > sendOffset ? sendMaxData - sendOffset : 0
-            print("[DataStream \(id)] generateFrames: pending=\(pending), sendMaxData=\(sendMaxData), sendOffset=\(sendOffset), availableWindow=\(availableWindow)")
+            Self.logger.trace("Stream \(self.id) generateFrames: pending=\(pending), sendMaxData=\(sendMaxData), sendOffset=\(sendOffset), availableWindow=\(availableWindow)")
 
             var frames: [StreamFrame] = []
             var remainingBytes = maxBytes

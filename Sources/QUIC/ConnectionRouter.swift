@@ -4,6 +4,7 @@
 /// Destination Connection ID (DCID).
 
 import Foundation
+import Logging
 import Synchronization
 import QUICCore
 
@@ -16,6 +17,7 @@ import QUICCore
 /// - New connection creation (for Initial packets to server)
 /// - Connection ID retirement and rotation
 public final class ConnectionRouter: Sendable {
+    private static let logger = Logger(label: "quic.connection.router")
     // MARK: - Types
 
     /// Result of routing a packet
@@ -104,8 +106,8 @@ public final class ConnectionRouter: Sendable {
         }
 
         // No existing connection found
-        print("[ConnectionRouter] Connection not found for DCID: \(dcid)")
-        print("[ConnectionRouter] Registered DCIDs: \(connections.withLock { Array($0.keys) })")
+        Self.logger.debug("Connection not found for DCID: \(dcid)")
+        Self.logger.debug("Registered DCIDs: \(connections.withLock { Array($0.keys) })")
 
         // For servers, Initial packets create new connections
         if isServer && packetType == .initial {
@@ -134,7 +136,7 @@ public final class ConnectionRouter: Sendable {
     ///   - connection: The connection to register
     ///   - connectionIDs: The connection IDs to associate with this connection
     public func register(_ connection: ManagedConnection, for connectionIDs: [ConnectionID]) {
-        print("[ConnectionRouter] Registering connection for CIDs: \(connectionIDs)")
+        Self.logger.debug("Registering connection for CIDs: \(connectionIDs)")
         let connID = ObjectIdentifier(connection)
         connections.withLock { conns in
             for cid in connectionIDs {
@@ -168,7 +170,7 @@ public final class ConnectionRouter: Sendable {
             }
             return conns.count
         }
-        print("[ConnectionRouter] UNREGISTER connection SCID=\(scid) removed CIDs: \(cids) (remaining: \(remainingCount))")
+        Self.logger.debug("UNREGISTER connection SCID=\(scid) removed CIDs: \(cids) (remaining: \(remainingCount))")
     }
 
     /// Unregisters specific connection IDs (without connection reference)

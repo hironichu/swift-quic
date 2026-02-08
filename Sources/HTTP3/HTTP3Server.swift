@@ -1,3 +1,5 @@
+import Logging
+
 /// HTTP/3 Server (RFC 9114)
 ///
 /// A server that listens for incoming QUIC connections and handles
@@ -54,6 +56,7 @@ import QPACK
 /// Accepts QUIC connections, establishes HTTP/3 sessions, and
 /// dispatches incoming requests to a registered handler.
 public actor HTTP3Server {
+    private static let logger = Logger(label: "http3.server")
 
     // MARK: - Types
 
@@ -346,7 +349,7 @@ public actor HTTP3Server {
             // Connection initialization or processing failed
             // Log the actual error so operators can diagnose the root cause
             // (e.g. streamLimitReached if QUIC handshake wasn't complete)
-            print("[HTTP3Server] Connection error for \(quicConnection.remoteAddress): \(error)")
+            Self.logger.warning("Connection error for \(quicConnection.remoteAddress): \(error)")
             // Close the connection with an appropriate error
             await h3Connection.close(error: .internalError)
         }

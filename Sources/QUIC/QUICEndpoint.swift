@@ -739,7 +739,7 @@ public actor QUICEndpoint {
             // No common version - close connection gracefully
             // RFC 9000: This isn't a protocol error, just an incompatibility
             await connection.close(error: nil)
-            print("[QUICEndpoint] UNREGISTER from handleVersionNegotiationPacket for SCID=\(connection.sourceConnectionID)")
+            logger.debug("UNREGISTER from handleVersionNegotiationPacket for SCID=\(connection.sourceConnectionID)")
             router.unregister(connection)
             timerManager.markClosed(connection)
         }
@@ -764,7 +764,7 @@ public actor QUICEndpoint {
             case .idleTimeout(let connection):
                 // Close connection due to idle timeout
                 await connection.close(error: nil)
-                print("[QUICEndpoint] UNREGISTER from processTimers idleTimeout for SCID=\(connection.sourceConnectionID)")
+                logger.info("Idle timeout: UNREGISTER for SCID=\(connection.sourceConnectionID)")
                 router.unregister(connection)
                 timerManager.markClosed(connection)
             }
@@ -796,7 +796,7 @@ public actor QUICEndpoint {
                 }
             } catch {
                 // Log error but continue processing
-                print("Error processing packet: \(error)")
+                logger.warning("Error processing packet: \(error)")
             }
         }
 
@@ -949,8 +949,7 @@ public actor QUICEndpoint {
                     try await socket.send(response, to: packet.remoteAddress)
                 }
             } catch {
-                // Log error for debugging
-                print("[QUICEndpoint] Error processing packet from \(remoteAddress): \(error)")
+                logger.warning("Error processing packet from \(remoteAddress): \(error)")
             }
         }
     }
@@ -974,25 +973,25 @@ public actor QUICEndpoint {
         sendSignal: AsyncStream<Void>,
         socket: any QUICSocket
     ) async {
-        print("[outboundSendLoop] STARTED for connection SCID=\(connection.sourceConnectionID)")
+        logger.debug("outboundSendLoop STARTED for connection SCID=\(connection.sourceConnectionID)")
         var iterationCount = 0
         for await _ in sendSignal {
             iterationCount += 1
-            print("[outboundSendLoop] signal #\(iterationCount) for SCID=\(connection.sourceConnectionID), shouldStop=\(shouldStop)")
-            guard !shouldStop else { print("[outboundSendLoop] breaking due to shouldStop"); break }
+            logger.trace("outboundSendLoop signal #\(iterationCount) for SCID=\(connection.sourceConnectionID), shouldStop=\(shouldStop)")
+            guard !shouldStop else { logger.debug("outboundSendLoop breaking due to shouldStop"); break }
 
             do {
                 // Generate packets from pending stream data
                 let packets = try connection.generateOutboundPackets()
                 if !packets.isEmpty {
-                    print("[QUICEndpoint] Sending \(packets.count) packets (total \(packets.map(\.count).reduce(0, +)) bytes)")
+                    logger.trace("Sending \(packets.count) packets (total \(packets.map(\.count).reduce(0, +)) bytes)")
                 }
 
                 // Send each packet
                 for packet in packets {
                     let nioAddress = try connection.remoteAddress.toNIOAddress()
                     try await socket.send(packet, to: nioAddress)
-                    print("[QUICEndpoint] Sent packet: \(packet.count) bytes")
+                    logger.trace("Sent packet: \(packet.count) bytes")
                 }
             } catch {
                 // Log error but continue - don't break the loop for transient errors
@@ -1014,7 +1013,7 @@ public actor QUICEndpoint {
         do {
             let finalPackets = try connection.generateOutboundPackets()
             if !finalPackets.isEmpty {
-                print("[outboundSendLoop] Flushing \(finalPackets.count) final packets for SCID=\(connection.sourceConnectionID)")
+                logger.debug("outboundSendLoop flushing \(finalPackets.count) final packets for SCID=\(connection.sourceConnectionID)")
                 for packet in finalPackets {
                     let nioAddress = try connection.remoteAddress.toNIOAddress()
                     try await socket.send(packet, to: nioAddress)
@@ -1031,7 +1030,7 @@ public actor QUICEndpoint {
             )
         }
 
-        print("[outboundSendLoop] EXITED for connection SCID=\(connection.sourceConnectionID) after \(iterationCount) iterations, shouldStop=\(shouldStop)")
+        logger.debug("outboundSendLoop EXITED for connection SCID=\(connection.sourceConnectionID) after \(iterationCount) iterations, shouldStop=\(shouldStop)")
         router.unregister(connection)
         timerManager.markClosed(connection)
     }

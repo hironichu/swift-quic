@@ -4,6 +4,7 @@
 /// and stream management. Implements QUICConnectionProtocol for public API.
 
 import Foundation
+import Logging
 import Synchronization
 import QUICCore
 import QUICCrypto
@@ -47,6 +48,8 @@ public enum HandshakeState: Sendable, Equatable {
 /// - Stream management via QUICConnectionProtocol
 /// - Anti-amplification limit enforcement (RFC 9000 Section 8.1)
 public final class ManagedConnection: Sendable {
+    private static let logger = Logger(label: "quic.connection.managed")
+
     // MARK: - Properties
 
     /// Connection handler (low-level orchestration)
@@ -363,7 +366,7 @@ public final class ManagedConnection: Sendable {
                 let serverSCID = longHeader.sourceConnectionID
                 // Only update on first Initial packet (when DCIDs differ)
                 if currentDCID != serverSCID {
-                    print("[ManagedConnection] Client updating DCID from \(currentDCID) to server's SCID \(serverSCID)")
+                    Self.logger.debug("Client updating DCID from \(currentDCID) to server's SCID \(serverSCID)")
                     state.withLock { state in
                         state.destinationConnectionID = serverSCID
                     }
@@ -433,7 +436,7 @@ public final class ManagedConnection: Sendable {
                     let serverSCID = longHeader.sourceConnectionID
                     // Only update on first Initial packet (when DCIDs differ)
                     if currentDCID != serverSCID {
-                        print("[ManagedConnection] Client updating DCID from \(currentDCID) to server's SCID \(serverSCID)")
+                        Self.logger.debug("Client updating DCID from \(currentDCID) to server's SCID \(serverSCID)")
                         state.withLock { state in
                             state.destinationConnectionID = serverSCID
                         }
@@ -747,15 +750,15 @@ public final class ManagedConnection: Sendable {
 
                 // Parse peer transport parameters
                 if let peerParams = tlsProvider.getPeerTransportParameters() {
-                    print("[ManagedConnection] Received peer transport parameters: \(peerParams.count) bytes")
+                    Self.logger.debug("Received peer transport parameters: \(peerParams.count) bytes")
                     if let params = decodeTransportParameters(peerParams) {
-                        print("[ManagedConnection] Decoded peer params: maxData=\(params.initialMaxData), bidiLocal=\(params.initialMaxStreamDataBidiLocal), bidiRemote=\(params.initialMaxStreamDataBidiRemote)")
+                        Self.logger.debug("Decoded peer params: maxData=\(params.initialMaxData), bidiLocal=\(params.initialMaxStreamDataBidiLocal), bidiRemote=\(params.initialMaxStreamDataBidiRemote)")
                         handler.setPeerTransportParameters(params)
                     } else {
-                        print("[ManagedConnection] ERROR: Failed to decode transport parameters!")
+                        Self.logger.error("Failed to decode transport parameters!")
                     }
                 } else {
-                    print("[ManagedConnection] ERROR: No peer transport parameters received from TLS!")
+                    Self.logger.error("No peer transport parameters received from TLS!")
                 }
 
                 // RFC 9000 Section 8.1: Lift amplification limit when handshake is confirmed
@@ -765,13 +768,13 @@ public final class ManagedConnection: Sendable {
                 // Both client and server can send 1-RTT data immediately after handshake completes
                 // HANDSHAKE_DONE frame is for "handshake confirmation", not a requirement to start sending data
                 handler.markHandshakeComplete()
-                print("[ManagedConnection] TLS handshake complete - enabling 1-RTT data transmission")
+                Self.logger.info("TLS handshake complete - enabling 1-RTT data transmission")
 
                 // Server: Send HANDSHAKE_DONE frame to client (RFC 9001 Section 4.1.2)
                 let role = state.withLock { $0.role }
                 if role == .server {
                     handler.queueFrame(.handshakeDone, level: .application)
-                    print("[ManagedConnection] Server queued HANDSHAKE_DONE frame")
+                    Self.logger.debug("Server queued HANDSHAKE_DONE frame")
                     signalNeedsSend()
                 }
 
@@ -875,7 +878,7 @@ public final class ManagedConnection: Sendable {
         // Handle new peer-initiated streams
         let scidForDebug = state.withLock { $0.sourceConnectionID }
         if !result.newStreams.isEmpty {
-            print("[ManagedConnection] processFrameResult: \(result.newStreams.count) new streams: \(result.newStreams) for SCID=\(scidForDebug)")
+            Self.logger.debug("processFrameResult: \(result.newStreams.count) new streams: \(result.newStreams) for SCID=\(scidForDebug)")
         }
         for streamID in result.newStreams {
             let isBidirectional = StreamID.isBidirectional(streamID)
@@ -887,17 +890,17 @@ public final class ManagedConnection: Sendable {
             incomingStreamState.withLock { state in
                 // Don't yield if shutdown
                 guard !state.isShutdown else {
-                    print("[ManagedConnection] NOT yielding stream \(streamID) - shutdown for SCID=\(scidForDebug)")
+                    Self.logger.trace("NOT yielding stream \(streamID) - shutdown for SCID=\(scidForDebug)")
                     return
                 }
 
                 if let continuation = state.continuation {
                     // Continuation exists, yield directly
-                    print("[ManagedConnection] Yielding stream \(streamID) directly to continuation for SCID=\(scidForDebug)")
+                    Self.logger.trace("Yielding stream \(streamID) directly to continuation for SCID=\(scidForDebug)")
                     continuation.yield(stream)
                 } else {
                     // Buffer the stream until incomingStreams is accessed
-                    print("[ManagedConnection] Buffering stream \(streamID) (no continuation yet, pendingCount=\(state.pendingStreams.count)) for SCID=\(scidForDebug)")
+                    Self.logger.trace("Buffering stream \(streamID) (no continuation yet, pendingCount=\(state.pendingStreams.count)) for SCID=\(scidForDebug)")
                     state.pendingStreams.append(stream)
                 }
             }
@@ -936,13 +939,13 @@ public final class ManagedConnection: Sendable {
                 s.handshakeState = .closed
                 return s.sourceConnectionID
             }
-            print("[ManagedConnection] shutdown() triggered by CONNECTION_CLOSE frame for SCID=\(scid)")
+            Self.logger.info("shutdown() triggered by CONNECTION_CLOSE frame for SCID=\(scid)")
             shutdown()  // Finish async streams to prevent hanging for-await loops
         }
 
         // Handle new connection IDs - register them with the router
         for frame in result.newConnectionIDs {
-            print("[ManagedConnection] Registering NEW_CONNECTION_ID: \(frame.connectionID)")
+            Self.logger.debug("Registering NEW_CONNECTION_ID: \(frame.connectionID)")
             onNewConnectionID.withLock { callback in
                 callback?(frame.connectionID)
             }
@@ -959,7 +962,7 @@ public final class ManagedConnection: Sendable {
 
         switch level {
         case .initial:
-            print("[ManagedConnection] Building Initial packet: SCID=\(scid), DCID=\(dcid)")
+            Self.logger.trace("Building Initial packet: SCID=\(scid), DCID=\(dcid)")
             let longHeader = LongHeader(
                 packetType: .initial,
                 version: version,
@@ -970,7 +973,7 @@ public final class ManagedConnection: Sendable {
             return .long(longHeader)
 
         case .handshake:
-            print("[ManagedConnection] Building Handshake packet: SCID=\(scid), DCID=\(dcid)")
+            Self.logger.trace("Building Handshake packet: SCID=\(scid), DCID=\(dcid)")
             let longHeader = LongHeader(
                 packetType: .handshake,
                 version: version,
@@ -981,7 +984,7 @@ public final class ManagedConnection: Sendable {
             return .long(longHeader)
 
         case .application:
-            print("[ManagedConnection] Building Application packet (1-RTT): SCID=\(scid), DCID=\(dcid)")
+            Self.logger.trace("Building Application packet (1-RTT): SCID=\(scid), DCID=\(dcid)")
             let shortHeader = ShortHeader(
                 destinationConnectionID: dcid,
                 spinBit: false,
@@ -1165,7 +1168,7 @@ extension ManagedConnection: QUICConnectionProtocol {
 
     public func close(error: UInt64?) async {
         let scid = state.withLock { $0.sourceConnectionID }
-        print("[ManagedConnection] close(error: \(String(describing: error))) called for SCID=\(scid)")
+        Self.logger.info("close(error: \(String(describing: error))) called for SCID=\(scid)")
         handler.close(error: error.map { ConnectionCloseError(code: $0) })
         state.withLock { $0.handshakeState = .closing }
         shutdown()
@@ -1173,7 +1176,7 @@ extension ManagedConnection: QUICConnectionProtocol {
 
     public func close(applicationError errorCode: UInt64, reason: String) async {
         let scid = state.withLock { $0.sourceConnectionID }
-        print("[ManagedConnection] close(applicationError: \(errorCode), reason: \(reason)) called for SCID=\(scid)")
+        Self.logger.info("close(applicationError: \(errorCode), reason: \(reason)) called for SCID=\(scid)")
         handler.close(error: ConnectionCloseError(code: errorCode, reason: reason))
         state.withLock { $0.handshakeState = .closing }
         shutdown()
@@ -1189,7 +1192,7 @@ extension ManagedConnection: QUICConnectionProtocol {
     /// new iterators from hanging (they get an already-finished stream).
     public func shutdown() {
         let scid = state.withLock { $0.sourceConnectionID }
-        print("[ManagedConnection] shutdown() called for SCID=\(scid)")
+        Self.logger.info("shutdown() called for SCID=\(scid)")
 
         // Finish incoming stream continuation and mark as shutdown
         // Guard against concurrent calls - finish() is idempotent but we avoid duplicate work
@@ -1225,7 +1228,7 @@ extension ManagedConnection: QUICConnectionProtocol {
         // Finish send signal stream to stop outboundSendLoop in QUICEndpoint
         state.withLock { s in
             guard !s.isSendSignalShutdown else { return }  // Already shutdown
-            print("[ManagedConnection] shutdown() finishing sendSignal for SCID=\(s.sourceConnectionID), hasContinuation=\(s.sendSignalContinuation != nil)")
+            Self.logger.debug("shutdown() finishing sendSignal for SCID=\(s.sourceConnectionID), hasContinuation=\(s.sendSignalContinuation != nil)")
             s.isSendSignalShutdown = true
             s.sendSignalContinuation?.finish()
             s.sendSignalContinuation = nil
@@ -1348,7 +1351,7 @@ extension ManagedConnection {
         state.withLock { s in
             // After shutdown, return an already-finished stream
             if s.isSendSignalShutdown {
-                print("[ManagedConnection] sendSignal accessed AFTER shutdown for SCID=\(s.sourceConnectionID)")
+                Self.logger.trace("sendSignal accessed AFTER shutdown for SCID=\(s.sourceConnectionID)")
                 if let existing = s.sendSignalStream { return existing }
                 let (stream, continuation) = AsyncStream<Void>.makeStream(
                     bufferingPolicy: .bufferingNewest(1)
@@ -1360,7 +1363,7 @@ extension ManagedConnection {
 
             // Return existing stream if already created (lazy initialization)
             if let existing = s.sendSignalStream {
-                print("[ManagedConnection] sendSignal returning EXISTING stream for SCID=\(s.sourceConnectionID), hasContinuation=\(s.sendSignalContinuation != nil)")
+                Self.logger.trace("sendSignal returning EXISTING stream for SCID=\(s.sourceConnectionID), hasContinuation=\(s.sendSignalContinuation != nil)")
                 return existing
             }
 
@@ -1371,7 +1374,7 @@ extension ManagedConnection {
             )
             s.sendSignalStream = stream
             s.sendSignalContinuation = continuation
-            print("[ManagedConnection] sendSignal CREATED new stream for SCID=\(s.sourceConnectionID)")
+            Self.logger.trace("sendSignal CREATED new stream for SCID=\(s.sourceConnectionID)")
             return stream
         }
     }
@@ -1383,12 +1386,12 @@ extension ManagedConnection {
     public func signalNeedsSend() {
         state.withLock { s in
             guard !s.isSendSignalShutdown else {
-                print("[ManagedConnection] signalNeedsSend SKIPPED (shutdown) for SCID=\(s.sourceConnectionID)")
+                Self.logger.trace("signalNeedsSend SKIPPED (shutdown) for SCID=\(s.sourceConnectionID)")
                 return
             }
             let hasContinuation = s.sendSignalContinuation != nil
             if !hasContinuation {
-                print("[ManagedConnection] signalNeedsSend WARNING: no continuation for SCID=\(s.sourceConnectionID), streamExists=\(s.sendSignalStream != nil)")
+                Self.logger.warning("signalNeedsSend: no continuation for SCID=\(s.sourceConnectionID), streamExists=\(s.sendSignalStream != nil)")
             }
             s.sendSignalContinuation?.yield(())
         }

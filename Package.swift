@@ -59,7 +59,9 @@ let package = Package(
 
         .target(
             name: "QUICCore",
-            dependencies: [],
+            dependencies: [
+                .product(name: "Logging", package: "swift-log"),
+            ],
             path: "Sources/QUICCore"
         ),
 
@@ -86,6 +88,7 @@ let package = Package(
                 "QUICCrypto",
                 "QUICStream",
                 "QUICRecovery",
+                .product(name: "Logging", package: "swift-log"),
             ],
             path: "Sources/QUICConnection",
             exclude: ["CONTEXT.md"]
@@ -97,6 +100,7 @@ let package = Package(
             name: "QUICStream",
             dependencies: [
                 "QUICCore",
+                .product(name: "Logging", package: "swift-log"),
             ],
             path: "Sources/QUICStream",
             exclude: ["CONTEXT.md"]
@@ -158,6 +162,7 @@ let package = Package(
                 "QPACK",
                 "QUICCore",
                 "QUICStream",
+                .product(name: "Logging", package: "swift-log"),
             ],
             path: "Sources/HTTP3"
         ),
@@ -227,6 +232,7 @@ let package = Package(
                 "QUICCore",
                 "QUICTransport",
                 .product(name: "NIOUDPTransport", package: "swift-nio-udp"),
+                .product(name: "Logging", package: "swift-log"),
             ],
             path: "Examples/QUICEchoServer"
         ),
@@ -240,6 +246,7 @@ let package = Package(
                 "HTTP3",
                 "QPACK",
                 .product(name: "NIOUDPTransport", package: "swift-nio-udp"),
+                .product(name: "Logging", package: "swift-log"),
             ],
             path: "Examples/HTTP3Demo"
         ),
