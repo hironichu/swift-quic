@@ -951,8 +951,16 @@ public actor QUICEndpoint {
         sendSignal: AsyncStream<Void>,
         socket: any QUICSocket
     ) async {
+        print("[outboundSendLoop] STARTED for connection SCID=\(connection.sourceConnectionID)")
+        var iterations = 0
+        
         for await _ in sendSignal {
-            guard !shouldStop else { break }
+            guard !shouldStop else { 
+                print("[outboundSendLoop] STOPPED (endpoint stopping) for SCID=\(connection.sourceConnectionID)")
+                break 
+            }
+            
+            iterations += 1
 
             do {
                 // Generate packets from pending stream data
@@ -962,6 +970,7 @@ public actor QUICEndpoint {
                 }
 
                 // Send each packet
+                // Note: We don't check isRunning mid-batch to avoid partial sends
                 for packet in packets {
                     let nioAddress = try connection.remoteAddress.toNIOAddress()
                     try await socket.send(packet, to: nioAddress)
@@ -969,15 +978,20 @@ public actor QUICEndpoint {
                 }
             } catch {
                 // Log error but continue - don't break the loop for transient errors
-                logger.warning(
-                    "Failed to send outbound packets",
-                    metadata: [
-                        "error": "\(error)",
-                        "remoteAddress": "\(connection.remoteAddress)"
-                    ]
-                )
+                // Only log if endpoint is still running (avoid noise during shutdown)
+                if isRunning && !shouldStop {
+                    logger.warning(
+                        "Failed to send outbound packets",
+                        metadata: [
+                            "error": "\(error)",
+                            "remoteAddress": "\(connection.remoteAddress)"
+                        ]
+                    )
+                }
             }
         }
+        
+        print("[outboundSendLoop] EXITED for connection SCID=\(connection.sourceConnectionID) after \(iterations) iterations, shouldStop=\(shouldStop)")
 
         // Loop ended: connection closed or endpoint stopping
         // Clean up connection from router and timer manager

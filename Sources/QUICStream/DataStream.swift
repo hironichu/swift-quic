@@ -266,6 +266,23 @@ public final class DataStream: Sendable {
                 throw StreamError.cannotReceiveOnSendOnlyStream
             }
 
+            // If stream is already fully read (dataRead state), silently ignore duplicate frames
+            // This handles retransmissions and out-of-order delivery gracefully (RFC 9000 Section 2.2)
+            if `internal`.state.recvState == .dataRead {
+                // Validate that duplicate frame doesn't violate final size
+                if let finalSize = `internal`.state.finalSize {
+                    let endOffset = frame.offset + UInt64(frame.data.count)
+                    if frame.fin && endOffset != finalSize {
+                        throw StreamError.finalSizeMismatch(expected: finalSize, received: endOffset)
+                    }
+                    if endOffset > finalSize {
+                        throw StreamError.finalSizeMismatch(expected: finalSize, received: endOffset)
+                    }
+                }
+                // Silently ignore the duplicate frame
+                return
+            }
+
             guard `internal`.state.canReceive else {
                 throw StreamError.invalidState(
                     current: String(describing: `internal`.state.recvState),
