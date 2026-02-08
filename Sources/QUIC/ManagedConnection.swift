@@ -619,6 +619,15 @@ public final class ManagedConnection: Sendable {
         var packetsByLevel: [EncryptionLevel: [(frames: [Frame], header: PacketHeader, packetNumber: UInt64)]] = [:]
 
         for packet in outboundPackets {
+            // Skip levels whose keys have already been discarded.
+            // This can happen due to a race between the outboundSendLoop
+            // (which calls generateOutboundPackets via signalNeedsSend)
+            // and the inline processTLSOutputs path that discards
+            // Initial/Handshake keys after handshake completion.
+            guard packetProcessor.hasKeys(for: packet.level) else {
+                continue
+            }
+
             let pn = handler.getNextPacketNumber(for: packet.level)
             let header = buildPacketHeader(for: packet.level, packetNumber: pn)
 

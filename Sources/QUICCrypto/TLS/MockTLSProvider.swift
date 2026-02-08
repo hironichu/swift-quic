@@ -388,40 +388,91 @@ public final class MockTLSProvider: TLS13Provider, Sendable {
         return outputs
     }
 
-    private func generateMockClientHello(localParams: Data?) -> Data {
-        // Mock ClientHello with marker
-        var data = Data("MOCK_CLIENT_HELLO".utf8)
-        if let params = localParams {
-            data.append(params)
+    /// Header markers used in mock TLS messages
+    private static let clientHelloMarker = Data("MOCK_CLIENT_HELLO".utf8)       // 17 bytes
+    private static let serverHelloMarker = Data("MOCK_SERVER_HELLO".utf8)       // 17 bytes
+    private static let encExtMarker = Data("MOCK_ENCRYPTED_EXTENSIONS".utf8)    // 25 bytes
+    private static let certificateMarker = Data("MOCK_CERTIFICATE".utf8)        // 16 bytes
+    private static let certVerifyMarker = Data("MOCK_CERT_VERIFY".utf8)         // 15 bytes
+    private static let finishedMarker = Data("MOCK_FINISHED".utf8)              // 13 bytes
+    private static let clientFinishedMarker = Data("MOCK_CLIENT_FINISHED".utf8) // 20 bytes
+
+    /// Appends a length-prefixed transport parameter block to a Data buffer.
+    /// Format: [4-byte big-endian length][transport parameter bytes]
+    private func appendLengthPrefixedParams(_ buffer: inout Data, params: Data?) {
+        if let params = params {
+            var len = UInt32(params.count).bigEndian
+            buffer.append(Data(bytes: &len, count: 4))
+            buffer.append(params)
+        } else {
+            // Zero-length block
+            buffer.append(contentsOf: [0, 0, 0, 0])
         }
+    }
+
+    /// Reads a length-prefixed transport parameter block from `data`,
+    /// starting at byte offset `headerLength` (relative to the first byte).
+    /// Returns the extracted parameters, or empty Data on failure.
+    private func readLengthPrefixedParams(from data: Data, headerLength: Int) -> Data {
+        // We need at least header + 4-byte length field
+        guard data.count >= headerLength + 4 else { return Data() }
+
+        // Use dropFirst for correct behaviour with Data slices whose startIndex != 0
+        let afterHeader = Data(data.dropFirst(headerLength))
+        guard afterHeader.count >= 4 else { return Data() }
+
+        // Read 4-byte big-endian length
+        let length: Int = afterHeader.withUnsafeBytes { buf in
+            Int(UInt32(bigEndian: buf.load(as: UInt32.self)))
+        }
+        guard length > 0, afterHeader.count >= 4 + length else { return Data() }
+
+        return Data(afterHeader.dropFirst(4).prefix(length))
+    }
+
+    private func generateMockClientHello(localParams: Data?) -> Data {
+        // Format: "MOCK_CLIENT_HELLO" | len(4) | params
+        var data = Self.clientHelloMarker
+        appendLengthPrefixedParams(&data, params: localParams)
         return data
     }
 
     private func generateMockServerHello() -> Data {
-        Data("MOCK_SERVER_HELLO".utf8)
+        Self.serverHelloMarker
     }
 
     private func generateMockServerHandshakeMessages(localParams: Data?) -> Data {
-        var data = Data("MOCK_ENCRYPTED_EXTENSIONS".utf8)
-        if let params = localParams {
-            data.append(params)
-        }
-        data.append(Data("MOCK_CERTIFICATE".utf8))
-        data.append(Data("MOCK_CERT_VERIFY".utf8))
-        data.append(Data("MOCK_FINISHED".utf8))
+        // Format: "MOCK_ENCRYPTED_EXTENSIONS" | len(4) | params | "MOCK_CERTIFICATE" | "MOCK_CERT_VERIFY" | "MOCK_FINISHED"
+        var data = Self.encExtMarker
+        appendLengthPrefixedParams(&data, params: localParams)
+        data.append(Self.certificateMarker)
+        data.append(Self.certVerifyMarker)
+        data.append(Self.finishedMarker)
         return data
     }
 
     private func generateMockFinished() -> Data {
-        Data("MOCK_CLIENT_FINISHED".utf8)
+        Self.clientFinishedMarker
     }
 
     private func extractMockTransportParameters(from data: Data) -> Data {
-        // In a real scenario, parse from TLS extension
-        // For mock, just return any embedded parameters
-        if data.count > 20 {
-            return Data(data.suffix(from: 17))  // Skip mock header
+        // Detect which mock message this is and extract the length-prefixed params.
+        // Use prefix comparison via dropFirst-safe slicing.
+        let bytes = Data(data) // normalise to startIndex == 0
+
+        if bytes.count >= Self.encExtMarker.count,
+           bytes.prefix(Self.encExtMarker.count) == Self.encExtMarker {
+            // Server handshake message – header is 25 bytes
+            return readLengthPrefixedParams(from: bytes, headerLength: Self.encExtMarker.count)
         }
+
+        if bytes.count >= Self.clientHelloMarker.count,
+           bytes.prefix(Self.clientHelloMarker.count) == Self.clientHelloMarker {
+            // Client hello – header is 17 bytes
+            return readLengthPrefixedParams(from: bytes, headerLength: Self.clientHelloMarker.count)
+        }
+
+        // Unknown format – return empty
         return Data()
     }
 
