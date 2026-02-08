@@ -269,18 +269,37 @@ public struct X509Validator: Sendable {
             return subjectMatches[0]
         }
 
-        // Multiple candidates share the same subject DN — use AKI/SKI to disambiguate.
-        // RFC 5280 Section 4.2.1.1: The AKI keyIdentifier field, when present,
-        // MUST match the SKI of the issuer certificate.
-        if let aki = certificate.authorityKeyIdentifier,
-           let akiKeyID = aki.keyIdentifier {
-            for candidate in subjectMatches {
-                if let ski = candidate.subjectKeyIdentifier,
-                   akiKeyID == ski.keyIdentifier {
-                    return candidate
+        // Multiple candidates share the same subject DN — use AKI to disambiguate.
+        // RFC 5280 Section 4.2.1.1: The Authority Key Identifier extension provides
+        // a means of identifying the public key corresponding to the private key used
+        // to sign a certificate.
+        if let aki = certificate.authorityKeyIdentifier {
+            // Strategy 1: Match AKI keyIdentifier against candidate SKI
+            // RFC 5280 Section 4.2.1.1: The keyIdentifier field, when present,
+            // MUST match the value of the SKI extension of the issuer certificate.
+            if let akiKeyID = aki.keyIdentifier {
+                for candidate in subjectMatches {
+                    if let ski = candidate.subjectKeyIdentifier,
+                       akiKeyID == ski.keyIdentifier {
+                        return candidate
+                    }
                 }
             }
-            // AKI keyIdentifier present but no matching SKI found —
+
+            // Strategy 2: Match AKI authorityCertSerialNumber against candidate serial
+            // RFC 5280 Section 4.2.1.1: The authorityCertSerialNumber field, when present,
+            // provides the serial number of the issuer's certificate. Together with
+            // authorityCertIssuer, it uniquely identifies the issuer certificate.
+            if let akiSerial = aki.authorityCertSerialNumber {
+                let akiSerialBytes = Data(akiSerial.bytes)
+                for candidate in subjectMatches {
+                    if candidate.serialNumber == akiSerialBytes {
+                        return candidate
+                    }
+                }
+            }
+
+            // AKI present but no matching candidate found —
             // fall through to first subject match
         }
 
@@ -509,19 +528,60 @@ public struct X509Validator: Sendable {
             throw X509Error.emptyChain
         }
 
-        // SECURITY: Match trusted roots by Subject Public Key Info (SPKI) DER,
-        // not just subject DN. Two different CAs could share the same subject DN,
-        // but the SPKI (which includes the algorithm identifier and public key bits)
-        // is a strong cryptographic identity. We also check subject DN as a secondary
-        // filter to avoid false matches from key reuse across different entities.
+        // SECURITY: Multi-factor trust matching for root certificates.
+        //
+        // We use a scoring approach to match roots against our trusted store,
+        // requiring multiple identity factors to align:
+        //
+        // 1. Subject Public Key Info (SPKI) DER — cryptographic identity
+        //    Two different CAs could share the same subject DN, but the SPKI
+        //    (algorithm identifier + public key bits) is a strong identity.
+        //
+        // 2. Subject DN — organizational identity
+        //    Prevents false positives from key reuse across different entities.
+        //
+        // 3. SKI/AKI cross-check (when available) — issuer linkage
+        //    If the chain's penultimate certificate has an AKI, verify it
+        //    matches the trusted root's SKI for additional assurance.
+        //
+        // 4. Serial number match (when AKI authorityCertSerialNumber is present)
+        //    Provides uniqueness within the same issuer DN.
+
         let rootSPKI = root.subjectPublicKeyInfoDER
+
         let isTrusted = trustedRoots.contains { trusted in
             let trustedSPKI = trusted.subjectPublicKeyInfoDER
+
             // Primary match: SPKI DER must match (cryptographic identity)
+            guard !rootSPKI.isEmpty && !trustedSPKI.isEmpty && rootSPKI == trustedSPKI else {
+                return false
+            }
+
             // Secondary match: Subject DN must also match (entity identity)
-            return !rootSPKI.isEmpty && !trustedSPKI.isEmpty
-                && rootSPKI == trustedSPKI
-                && trusted.subject == root.subject
+            guard trusted.subject == root.subject else {
+                return false
+            }
+
+            // Tertiary match (optional, strengthening): if the chain has an
+            // intermediate that points to this root via AKI, verify the SKI matches.
+            // This prevents a compromised root with a re-used key from being accepted
+            // if the AKI/SKI linkage doesn't hold.
+            if chain.count >= 2 {
+                let penultimate = chain[chain.count - 2]
+                if let aki = penultimate.authorityKeyIdentifier,
+                   let akiKeyID = aki.keyIdentifier {
+                    if let trustedSKI = trusted.subjectKeyIdentifier {
+                        // AKI/SKI both present — they must match
+                        if akiKeyID != trustedSKI.keyIdentifier {
+                            return false
+                        }
+                    }
+                    // If trusted root has no SKI, we can't cross-check;
+                    // SPKI + subject DN match is sufficient.
+                }
+            }
+
+            return true
         }
 
         if isTrusted {

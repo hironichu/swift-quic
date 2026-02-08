@@ -151,7 +151,7 @@ struct X509Tests {
     @Test("ASN1Parser throws on underflow")
     func parseUnderflow() throws {
         let data = Data([0x02, 0x05, 0x01])  // Claims 5 bytes but only has 1
-        #expect(throws: ASN1Error.self) {
+        #expect(throws: QUICCrypto.ASN1Error.self) {
             _ = try ASN1Parser.parseOne(from: data)
         }
     }

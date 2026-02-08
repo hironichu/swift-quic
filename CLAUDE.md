@@ -346,6 +346,26 @@ public protocol QUICStream: Sendable {
 - [x] Session resumption (PSK)
 - [x] 0-RTT early data
 - [x] MockTLSProvider for testing (#if DEBUG guarded)
+- [x] Phase A: Security fixes
+  - [x] Client state machine rejects Finished before Certificate/CertificateVerify
+  - [x] Trust matching strengthened from subject-only to SPKI DER + subject DN
+  - [x] Issuer identification improved with AKI/SKI disambiguation
+  - [x] EKU verification uses actual required EKU instead of hardcoded fallback
+- [x] Phase B: Revocation & trust usability
+  - [x] RevocationCheckMode (.none/.ocspStapling/.ocsp/.crl/.bestEffort)
+  - [x] Async revocation checking outside state machine lock
+  - [x] effectiveTrustedRoots resolves trustedRootCertificates → trustedCACertificates
+  - [x] PEM/DER loading helpers (loadTrustedCAs, addTrustedCAs)
+  - [x] ValidatedChain struct for chain-returning validation
+  - [x] X509Validator.validateWithRevocation() async method
+- [x] Phase C: System trust store & hardening
+  - [x] SystemTrustStore (macOS SecTrustCopyAnchorCertificates, Linux /etc/ssl/certs)
+  - [x] TLSConfiguration.useSystemTrustStore() / addSystemTrustStore()
+  - [x] effectiveTrustedRootsWithSystemFallback (auto-loads system roots)
+  - [x] findIssuer AKI authorityCertSerialNumber matching (RFC 5280)
+  - [x] verifyTrust multi-factor matching (SPKI + DN + AKI/SKI cross-check)
+  - [x] QUICConfiguration legacy TLS field documentation (certificatePath, privateKeyPath, verifyPeer)
+  - [x] TLS security model documentation (TLS_SECURITY.md)
 
 ### Phase 4: Connection Layer ✅
 - [x] Connection state machine

@@ -124,18 +124,38 @@ public struct QUICConfiguration: Sendable {
 
     // MARK: - ALPN
 
-    /// Application Layer Protocol Negotiation protocols
+    /// Application Layer Protocol Negotiation protocols.
+    ///
+    /// Used for QUIC transport parameter negotiation. For TLS-level ALPN
+    /// configuration, use `TLSConfiguration.alpnProtocols` instead.
     public var alpn: [String]
 
-    // MARK: - TLS
+    // MARK: - TLS (Legacy — prefer TLSConfiguration)
 
-    /// Path to certificate file (for servers)
+    /// Path to certificate file (for servers).
+    ///
+    /// - Warning: **Legacy field.** This field is **not consumed** by
+    ///   `TLS13Handler` and exists only for backward compatibility.
+    ///   Use `TLSConfiguration.certificatePath` or
+    ///   `TLSConfiguration.server(certificatePath:privateKeyPath:)` instead.
+    ///   This field will be removed in a future release.
     public var certificatePath: String?
 
-    /// Path to private key file (for servers)
+    /// Path to private key file (for servers).
+    ///
+    /// - Warning: **Legacy field.** This field is **not consumed** by
+    ///   `TLS13Handler` and exists only for backward compatibility.
+    ///   Use `TLSConfiguration.privateKeyPath` or
+    ///   `TLSConfiguration.server(certificatePath:privateKeyPath:)` instead.
+    ///   This field will be removed in a future release.
     public var privateKeyPath: String?
 
-    /// Whether to verify peer certificates (default: true)
+    /// Whether to verify peer certificates (default: true).
+    ///
+    /// - Warning: **Legacy field.** This field is **not consumed** by
+    ///   `TLS13Handler` and exists only for backward compatibility.
+    ///   Use `TLSConfiguration.verifyPeer` instead.
+    ///   This field will be removed in a future release.
     public var verifyPeer: Bool
 
     /// Custom TLS provider factory (legacy).
@@ -171,7 +191,13 @@ public struct QUICConfiguration: Sendable {
 
     // MARK: - Initialization
 
-    /// Creates a default configuration
+    /// Creates a default configuration.
+    ///
+    /// - Note: The legacy TLS fields (`certificatePath`, `privateKeyPath`,
+    ///   `verifyPeer`) are initialized for backward compatibility but are **not**
+    ///   consumed by the TLS stack. Use `TLSConfiguration` for all TLS settings,
+    ///   and prefer `QUICConfiguration.production()` or `.development()` factory
+    ///   methods for new code.
     public init() {
         self.maxIdleTimeout = .seconds(30)
         self.maxUDPPayloadSize = 1200

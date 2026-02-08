@@ -76,7 +76,7 @@ let package = Package(
                 .product(name: "SwiftASN1", package: "swift-asn1"),
             ],
             path: "Sources/QUICCrypto",
-            exclude: ["CONTEXT.md", "TLS/CONTEXT.md"]
+            exclude: ["CONTEXT.md", "TLS/CONTEXT.md", "TLS/TLS_SECURITY.md"]
         ),
 
         // MARK: - Connection Management
