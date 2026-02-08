@@ -427,6 +427,13 @@ public final class QUICConnectionHandler: Sendable {
         pnSpaceManager.handshakeConfirmed = true
     }
 
+    /// Gets peer transport parameters
+    ///
+    /// - Returns: Peer's transport parameters, or nil if not yet received
+    public func getPeerTransportParameters() -> TransportParameters? {
+        peerTransportParams.withLock { $0 }
+    }
+
     /// Sets peer transport parameters (called after TLS handshake)
     ///
     /// This updates various components with the peer's advertised limits and settings,

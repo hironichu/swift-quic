@@ -728,13 +728,14 @@ public final class ManagedConnection: Sendable {
         var outboundPackets: [Data] = []
         var handshakeCompleted = false
 
+        // CRITICAL: Process ALL TLS outputs before generating any packets
+        // This ensures all keys are installed before attempting packet encryption
+        // to avoid "noSealer" errors during WebTransport handshake completion
         for output in outputs {
             switch output {
             case .handshakeData(let data, let level):
-                // Queue CRYPTO frames
+                // Queue CRYPTO frames (don't signal yet - wait until all outputs processed)
                 handler.queueCryptoData(data, level: level)
-                // Signal that packets need to be sent
-                signalNeedsSend()
 
             case .keysAvailable(let info):
                 // Install keys via PacketProcessor (single source of truth for crypto)
@@ -771,7 +772,7 @@ public final class ManagedConnection: Sendable {
                 if role == .server {
                     handler.queueFrame(.handshakeDone, level: .application)
                     print("[ManagedConnection] Server queued HANDSHAKE_DONE frame")
-                    signalNeedsSend()
+                    // Don't signal yet - wait until all outputs processed and packets generated
                 }
 
                 // Mark handshake as established but don't discard keys yet
@@ -802,7 +803,8 @@ public final class ManagedConnection: Sendable {
             }
         }
 
-        // Generate packets from queued frames (BEFORE discarding keys)
+        // Generate packets from queued frames (AFTER all outputs processed, BEFORE discarding keys)
+        // At this point, all keys from TLS outputs have been installed, preventing "noSealer" errors
         let packets = try generateOutboundPackets()
         outboundPackets.append(contentsOf: packets)
 
@@ -1163,7 +1165,7 @@ extension ManagedConnection: QUICConnectionProtocol {
 
     public func sendDatagram(_ data: Data) async throws {
         // Check if datagrams are supported (negotiated with peer)
-        guard let peerParams = peerTransportParameters,
+        guard let peerParams = handler.getPeerTransportParameters(),
               peerParams.maxDatagramFrameSize > 0 else {
             throw QUICError.datagramsNotSupported
         }
