@@ -7,10 +7,7 @@ import Foundation
 import Crypto
 @preconcurrency import X509
 import SwiftASN1
-public protocol HTTPClient: Sendable {
-    func post(url: URL, body: Data, contentType: String) async throws -> (Data, Int)
-    func get(url: URL) async throws -> (Data, Int)
-}
+
 // MARK: - Revocation Check Mode
 
 /// Certificate revocation checking strategy
@@ -126,20 +123,16 @@ public enum RevocationReason: UInt8, Sendable {
 /// }
 /// ```
 public struct RevocationChecker: Sendable {
-    /// Revocation checking mode
+    /// The checking mode
     public let mode: RevocationCheckMode
 
-    /// Timeout for online checks
+    /// Network timeout for online checks
     public let timeout: Duration
 
-    /// HTTP client for online checks
-    private let httpClient: HTTPClient?
-
-    /// Initialize revocation checker
-    public init(mode: RevocationCheckMode, timeout: Duration = .seconds(5), httpClient: HTTPClient? = nil) {
+    /// Creates a revocation checker with the specified mode
+    public init(mode: RevocationCheckMode, timeout: Duration = .seconds(5)) {
         self.mode = mode
         self.timeout = timeout
-        self.httpClient = httpClient
     }
 
     /// Checks the revocation status of a certificate
@@ -309,10 +302,6 @@ public struct RevocationChecker: Sendable {
         _ certificate: X509Certificate,
         issuer: X509Certificate
     ) async throws -> RevocationStatus {
-        guard let client = httpClient else {
-            throw RevocationError.ocspFetchFailed("No HTTP client configured for online OCSP check")
-        }
-
         // Get OCSP responder URL from certificate's AIA extension
         guard let ocspURL = certificate.getOCSPResponderURL() else {
             throw RevocationError.noOCSPResponder
@@ -321,20 +310,21 @@ public struct RevocationChecker: Sendable {
         // Build OCSP request
         let request = try buildOCSPRequest(for: certificate, issuer: issuer)
 
-        // Send request using injected HTTP client
-        let (data, statusCode) = try await client.post(
-            url: ocspURL,
-            body: request,
-            contentType: "application/ocsp-request"
-        )
+        // Send request
+        var urlRequest = URLRequest(url: ocspURL)
+        urlRequest.httpMethod = "POST"
+        urlRequest.httpBody = request
+        urlRequest.setValue("application/ocsp-request", forHTTPHeaderField: "Content-Type")
 
-        guard statusCode == 200 else {
-            throw RevocationError.ocspFetchFailed("Invalid HTTP response: \(statusCode)")
+        let (data, response) = try await URLSession.shared.data(for: urlRequest)
+
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            throw RevocationError.ocspFetchFailed("Invalid HTTP response")
         }
 
         return try verifyOCSPResponse(data, for: certificate, issuer: issuer)
     }
-
 
     /// Builds an OCSP request for a certificate
     private func buildOCSPRequest(
@@ -421,15 +411,12 @@ public struct RevocationChecker: Sendable {
             }
         }
 
-        guard let client = httpClient else {
-            throw RevocationError.crlFetchFailed("No HTTP client configured for CRL fetch")
-        }
+        // Fetch CRL
+        let (data, response) = try await URLSession.shared.data(from: crlURL)
 
-        // Fetch CRL using injected HTTP client
-        let (data, statusCode) = try await client.get(url: crlURL)
-
-        guard statusCode == 200 else {
-            throw RevocationError.crlFetchFailed("Invalid HTTP response: \(statusCode)")
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            throw RevocationError.crlFetchFailed("Invalid HTTP response")
         }
 
         // Parse CRL
@@ -444,7 +431,6 @@ public struct RevocationChecker: Sendable {
 
         return checkCertificateInCRL(certificate, crl: crl)
     }
-
 
     private func loadCachedCRL(from directory: URL, for url: URL) -> CRL? {
         let cacheFile = directory.appendingPathComponent(url.absoluteString.data(using: .utf8)!.base64EncodedString())

@@ -12,7 +12,7 @@
 /// ```
 
 import Foundation
-import Crypto
+
 /// TLS 1.3 ClientHello message
 public struct ClientHello: Sendable {
 
@@ -51,8 +51,10 @@ public struct ClientHello: Sendable {
         cipherSuites: [CipherSuite] = [.tls_aes_128_gcm_sha256],
         extensions: [TLSExtension]
     ) {
-        let key = SymmetricKey(size: .bits256)
-        let random = key.withUnsafeBytes { Data($0) }
+        var random = Data(count: TLSConstants.randomLength)
+        random.withUnsafeMutableBytes { ptr in
+            _ = SecRandomCopyBytes(kSecRandomDefault, TLSConstants.randomLength, ptr.baseAddress!)
+        }
         self.init(random: random, legacySessionID: legacySessionID, cipherSuites: cipherSuites, extensions: extensions)
     }
 

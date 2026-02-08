@@ -4,7 +4,13 @@ import PackageDescription
 
 let package = Package(
     name: "swift-quic",
-
+    platforms: [
+        .macOS(.v15),
+        .iOS(.v18),
+        .tvOS(.v18),
+        .watchOS(.v11),
+        .visionOS(.v2),
+    ],
     products: [
         // Main public API
         .library(
@@ -19,7 +25,7 @@ let package = Package(
     ],
     dependencies: [
         // UDP transport
-        .package(url: "https://github.com/hironichu/swift-nio-udp", branch: "main"),
+        .package(url: "https://github.com/1amageek/swift-nio-udp.git", from: "1.0.0"),
 
         // Cryptography
         .package(url: "https://github.com/apple/swift-crypto.git", from: "4.2.0"),

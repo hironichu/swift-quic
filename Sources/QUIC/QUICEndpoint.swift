@@ -582,12 +582,7 @@ public actor QUICEndpoint {
         let tlsProvider = try createTLSProvider(isClient: false)
 
         // Create transport parameters from configuration
-        // For servers, we MUST include original_destination_connection_id (RFC 9000 Section 18.2)
-        let transportParameters = TransportParameters(
-            from: configuration,
-            sourceConnectionID: sourceConnectionID,
-            originalDestinationConnectionID: info.destinationConnectionID
-        )
+        let transportParameters = TransportParameters(from: configuration, sourceConnectionID: sourceConnectionID)
 
         // Create connection
         // For servers:

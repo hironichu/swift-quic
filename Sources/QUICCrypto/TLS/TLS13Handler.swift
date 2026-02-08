@@ -53,13 +53,6 @@ public final class TLS13Handler: TLS13Provider, Sendable {
 
     // MARK: - Initialization
 
-    /// Creates a TLS 1.3 handler with the given configuration.
-    ///
-    /// If the configuration has `certificatePath` and `privateKeyPath` set but
-    /// `certificateChain` and `signingKey` are not populated, they will be
-    /// loaded lazily when the server processes the first ClientHello.
-    ///
-    /// - Parameter configuration: TLS configuration
     public init(configuration: TLSConfiguration = TLSConfiguration()) {
         self.configuration = configuration
     }
@@ -89,7 +82,7 @@ public final class TLS13Handler: TLS13Provider, Sendable {
                 result.insert(.handshakeData(clientHello, level: .initial), at: 0)
                 return result
             } else {
-                let serverMachine = try ServerStateMachine(configuration: configuration)
+                let serverMachine = ServerStateMachine(configuration: configuration)
                 state.serverStateMachine = serverMachine
                 return []  // Server waits for ClientHello
             }
@@ -531,19 +524,8 @@ public final class ServerStateMachine: Sendable {
         var context: HandshakeContext = HandshakeContext()
     }
 
-    /// Creates a server state machine with the given configuration.
-    ///
-    /// If the configuration has `certificatePath` and `privateKeyPath` set but
-    /// `certificateChain` and `signingKey` are not populated, this initializer
-    /// will attempt to load the certificates and key from the PEM files.
-    ///
-    /// - Parameters:
-    ///   - configuration: TLS configuration (will be resolved to load certificates if needed)
-    ///   - sessionTicketStore: Optional session ticket store for resumption
-    /// - Throws: `PEMLoader.PEMError` if PEM file loading fails
-    public init(configuration: TLSConfiguration, sessionTicketStore: SessionTicketStore? = nil) throws {
-        // Resolve configuration by loading certificates from paths if needed
-        self.configuration = try configuration.withLoadedCertificates()
+    public init(configuration: TLSConfiguration, sessionTicketStore: SessionTicketStore? = nil) {
+        self.configuration = configuration
         self.sessionTicketStore = sessionTicketStore
     }
 
@@ -1163,8 +1145,10 @@ public final class ServerStateMachine: Sendable {
             }
 
             // Generate random ticket_age_add
-            var rng = SystemRandomNumberGenerator()
-            let ticketAgeAdd = UInt32.random(in: UInt32.min...UInt32.max, using: &rng)
+            var ticketAgeAdd: UInt32 = 0
+            withUnsafeMutableBytes(of: &ticketAgeAdd) { ptr in
+                _ = SecRandomCopyBytes(kSecRandomDefault, 4, ptr.baseAddress!)
+            }
 
             // Create stored session
             let session = SessionTicketStore.StoredSession(

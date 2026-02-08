@@ -53,9 +53,10 @@ public final class ClientStateMachine: Sendable {
             state.context.keyExchange = keyExchange
 
             // Generate random
-            let key = SymmetricKey(size: .bits256)
-            let random = key.withUnsafeBytes { Data($0) }
-
+            var random = Data(count: TLSConstants.randomLength)
+            random.withUnsafeMutableBytes { ptr in
+                _ = SecRandomCopyBytes(kSecRandomDefault, TLSConstants.randomLength, ptr.baseAddress!)
+            }
             state.context.clientRandom = random
 
             // Session ID for TLS 1.3 over QUIC

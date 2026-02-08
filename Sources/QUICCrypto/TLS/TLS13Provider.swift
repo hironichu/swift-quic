@@ -267,34 +267,15 @@ public struct TLSConfiguration: Sendable {
     }
 
     /// Creates a server configuration with file paths
-    ///
-    /// This method loads the certificate and private key from PEM files
-    /// and populates `certificateChain` and `signingKey`.
-    ///
-    /// - Parameters:
-    ///   - certificatePath: Path to the PEM-encoded certificate file (may contain a chain)
-    ///   - privateKeyPath: Path to the PEM-encoded private key file
-    ///   - alpnProtocols: ALPN protocols to advertise
-    /// - Returns: A configured TLSConfiguration
-    /// - Throws: `PEMLoader.PEMError` if loading fails
     public static func server(
         certificatePath: String,
         privateKeyPath: String,
         alpnProtocols: [String] = ["h3"]
-    ) throws -> TLSConfiguration {
+    ) -> TLSConfiguration {
         var config = TLSConfiguration()
         config.certificatePath = certificatePath
         config.privateKeyPath = privateKeyPath
         config.alpnProtocols = alpnProtocols
-
-        // Load certificate and key from PEM files
-        let (certificates, signingKey) = try PEMLoader.loadCertificateAndKey(
-            certificatePath: certificatePath,
-            privateKeyPath: privateKeyPath
-        )
-        config.certificateChain = certificates
-        config.signingKey = signingKey
-
         return config
     }
 
@@ -310,44 +291,5 @@ public struct TLSConfiguration: Sendable {
     public var hasCertificate: Bool {
         (certificateChain != nil && signingKey != nil) ||
         (certificatePath != nil && privateKeyPath != nil)
-    }
-
-    // MARK: - PEM Loading
-
-    /// Loads certificate and private key from the configured file paths.
-    ///
-    /// Call this method to populate `certificateChain` and `signingKey` from
-    /// `certificatePath` and `privateKeyPath`.
-    ///
-    /// - Throws: `PEMLoader.PEMError` if loading fails
-    public mutating func loadFromPaths() throws {
-        guard let certPath = certificatePath,
-              let keyPath = privateKeyPath else {
-            return  // Nothing to load
-        }
-
-        // Only load if not already populated
-        guard certificateChain == nil || signingKey == nil else {
-            return
-        }
-
-        let (certificates, key) = try PEMLoader.loadCertificateAndKey(
-            certificatePath: certPath,
-            privateKeyPath: keyPath
-        )
-        self.certificateChain = certificates
-        self.signingKey = key
-    }
-
-    /// Returns a copy with certificates loaded from paths (if needed).
-    ///
-    /// This is useful for getting a resolved configuration without mutating the original.
-    ///
-    /// - Returns: A TLSConfiguration with `certificateChain` and `signingKey` populated
-    /// - Throws: `PEMLoader.PEMError` if loading fails
-    public func withLoadedCertificates() throws -> TLSConfiguration {
-        var copy = self
-        try copy.loadFromPaths()
-        return copy
     }
 }

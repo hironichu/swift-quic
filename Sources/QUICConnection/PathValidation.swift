@@ -7,7 +7,7 @@
 import Foundation
 import Synchronization
 import QUICCore
-import Crypto
+
 // MARK: - Path Validation State
 
 /// State of a path validation attempt
@@ -202,8 +202,11 @@ public final class PathValidationManager: Sendable {
 
     /// Generates random 8-byte challenge data
     private func generateChallengeData() -> Data {
-        // 8 bytes (64 bits) using Swift Crypto (cross-platform)
-        SymmetricKey(size: SymmetricKeySize(bitCount: 64)).withUnsafeBytes { Data($0) }
+        var data = Data(count: 8)
+        data.withUnsafeMutableBytes { ptr in
+            _ = SecRandomCopyBytes(kSecRandomDefault, 8, ptr.baseAddress!)
+        }
+        return data
     }
 }
 
@@ -419,7 +422,10 @@ public final class ConnectionIDManager: Sendable {
 
     /// Generates a random 16-byte stateless reset token
     private func generateStatelessResetToken() -> Data {
-        // 16 bytes (128 bits) using Swift Crypto (cross-platform)
-        SymmetricKey(size: .bits128).withUnsafeBytes { Data($0) }
+        var token = Data(count: 16)
+        token.withUnsafeMutableBytes { ptr in
+            _ = SecRandomCopyBytes(kSecRandomDefault, 16, ptr.baseAddress!)
+        }
+        return token
     }
 }
