@@ -228,6 +228,8 @@ public final class QUICConnectionHandler: Sendable {
     ) throws -> FrameProcessingResult {
         var result = FrameProcessingResult()
 
+        print("[QUICConnectionHandler] Processing \(frames.count) frames at \(level): \(frames.map { String(describing: type(of: $0)) })")
+
         for frame in frames {
             // RFC 9000 §12.4: Validate frame type is allowed at this encryption level
             guard frame.isValid(at: level) else {
