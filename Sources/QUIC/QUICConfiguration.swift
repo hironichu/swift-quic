@@ -59,8 +59,8 @@ public enum QUICSecurityError: Error, Sendable {
 
 /// Factory for creating TLS 1.3 providers.
 ///
-/// This allows custom TLS implementations (like libp2p's TLS with
-/// X.509 certificate extensions) to be injected into QUIC connections.
+/// This allows custom TLS implementations (with custom X.509 certificate
+/// extensions or validation logic) to be injected into QUIC connections.
 ///
 /// ## Example
 ///
@@ -142,7 +142,7 @@ public struct QUICConfiguration: Sendable {
     ///
     /// When set, this factory is used to create TLS providers for new connections
     /// instead of the default MockTLSProvider. This enables custom TLS
-    /// implementations like libp2p's certificate-based peer authentication.
+    /// implementations with application-specific certificate authentication.
     ///
     /// - Note: Prefer using `securityMode` for new code. This property is
     ///   maintained for backward compatibility.

@@ -165,7 +165,7 @@ extension X509Certificate {
 
     /// Gets the raw value of an extension by OID
     ///
-    /// - Parameter oid: The OID to search for (e.g., "1.3.6.1.4.1.53594.1.1" for libp2p)
+    /// - Parameter oid: The OID to search for (e.g., "2.5.29.17" for Subject Alternative Name)
     /// - Returns: The raw extension value if found, nil otherwise
     public func extensionValue(for oid: String) -> Data? {
         guard let targetOID = try? ASN1ObjectIdentifier(dotRepresentation: oid) else {

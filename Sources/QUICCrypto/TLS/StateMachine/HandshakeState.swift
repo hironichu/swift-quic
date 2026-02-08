@@ -310,7 +310,7 @@ public struct HandshakeContext: Sendable {
     /// Application-specific peer info from certificate validator.
     ///
     /// Stores the return value from `TLSConfiguration.certificateValidator`.
-    /// For libp2p, this would be the peer's `PeerID`.
+    /// For example, this could be an application-specific peer identity.
     public var validatedPeerInfo: (any Sendable)?
 
     public init() {

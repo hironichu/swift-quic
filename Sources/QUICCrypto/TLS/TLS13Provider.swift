@@ -116,15 +116,15 @@ public protocol TLS13Provider: Sendable {
 /// handles content validation (e.g., checking extensions, deriving application-specific data).
 ///
 /// - Parameter certificates: The peer's certificate chain (DER encoded), leaf first
-/// - Returns: Application-specific peer info (e.g., PeerID for libp2p), or nil if not needed
+/// - Returns: Application-specific peer info (e.g., verified peer identity), or nil if not needed
 /// - Throws: If certificate validation fails (will abort the handshake)
 ///
-/// ## Example (libp2p)
+/// ## Example
 /// ```swift
 /// config.certificateValidator = { certChain in
 ///     guard let certData = certChain.first else { throw MyError.noCertificate }
-///     let peerID = try extractLibP2PPeerID(from: certData)
-///     return peerID
+///     let peerIdentity = try extractPeerIdentity(from: certData)
+///     return peerIdentity
 /// }
 /// ```
 public typealias CertificateValidator = @Sendable ([Data]) throws -> (any Sendable)?
@@ -200,7 +200,7 @@ public struct TLSConfiguration: Sendable {
     /// RFC 8446 Section 4.3.2: "A server which is authenticating with a certificate
     /// MAY optionally request a certificate from the client."
     ///
-    /// - Note: For libp2p, this should always be `true` as mutual authentication is required.
+    /// - Note: Set to `true` when mutual authentication is required.
     public var requireClientCertificate: Bool
 
     /// Custom certificate validator for peer certificates.
@@ -208,7 +208,7 @@ public struct TLSConfiguration: Sendable {
     /// Called after TLS signature verification (CertificateVerify) succeeds, but before
     /// the handshake is considered complete. This allows applications to:
     /// - Validate certificate content (extensions, constraints)
-    /// - Extract application-specific data (e.g., PeerID for libp2p)
+    /// - Extract application-specific data (e.g., peer identity)
     /// - Implement custom trust models (e.g., self-signed with specific extensions)
     ///
     /// If `nil`, only TLS-level verification is performed:

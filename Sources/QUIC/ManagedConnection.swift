@@ -1436,7 +1436,7 @@ extension ManagedConnection {
     /// The TLS provider used for this connection.
     ///
     /// Provides access to the underlying TLS 1.3 provider for custom
-    /// authentication schemes (e.g., libp2p certificate-based PeerID extraction).
+    /// authentication schemes (e.g., certificate-based peer identity extraction).
     public var underlyingTLSProvider: any TLS13Provider {
         tlsProvider
     }

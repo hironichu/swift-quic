@@ -219,7 +219,7 @@ public final class TLS13Handler: TLS13Provider, Sendable {
     /// Validated peer info from certificate validator callback.
     ///
     /// This contains the value returned by `TLSConfiguration.certificateValidator`
-    /// after successful certificate validation (e.g., PeerID for libp2p).
+    /// after successful certificate validation (e.g., application-specific peer identity).
     public var validatedPeerInfo: (any Sendable)? {
         state.withLock { state in
             if state.isClientMode {
@@ -1275,7 +1275,7 @@ public final class ServerStateMachine: Sendable {
     /// Validated peer info from certificate validator callback.
     ///
     /// This contains the value returned by `TLSConfiguration.certificateValidator`
-    /// after successful certificate validation (e.g., PeerID for libp2p).
+    /// after successful certificate validation (e.g., application-specific peer identity).
     public var validatedPeerInfo: (any Sendable)? {
         state.withLock { $0.context.validatedPeerInfo }
     }

@@ -4,7 +4,7 @@ A pure Swift implementation of the QUIC transport protocol (RFC 9000, 9001, 9002
 
 ## Overview
 
-swift-quic provides a modern, type-safe QUIC implementation designed for the swift-libp2p networking stack. It leverages Swift's concurrency features and follows protocol-oriented design principles.
+swift-quic provides a modern, type-safe QUIC implementation designed for modern Swift applications. It leverages Swift's concurrency features and follows protocol-oriented design principles.
 
 ## Features
 

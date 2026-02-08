@@ -1,15 +1,15 @@
 # swift-quic Design Document
 
-> **Project**: swift-quic - Pure Swift implementation of QUIC (RFC 9000)
-> **Goal**: Provide a modern, async/await-based QUIC implementation for libp2p
+> **Project**: swift-quic - Pure Swift implementation of QUIC (RFC 9000) and HTTP/3 (RFC 9114)
+> **Goal**: Provide a modern, async/await-based QUIC and HTTP/3 implementation for Swift applications
 
 ## Overview
 
-This is a clean-room implementation of QUIC protocol in Swift, designed primarily for libp2p integration but usable as a standalone QUIC library.
+This is a clean-room implementation of the QUIC protocol in Swift, fully compliant with RFC 9000, RFC 9001, RFC 9002, and RFC 9114 (HTTP/3).
 
 ## Design Principles
 
-Following swift-libp2p conventions:
+Following modern Swift conventions:
 - **async/await everywhere** - No EventLoopFuture
 - **Value types first** - struct > class for data
 - **Protocol-oriented** - Define protocols first, implementations separate
@@ -268,7 +268,7 @@ public struct QUICConfiguration: Sendable {
     public var initialMaxStreamDataUni: UInt64 = 1_000_000
     public var initialMaxStreamsBidi: UInt64 = 100
     public var initialMaxStreamsUni: UInt64 = 100
-    public var alpn: [String] = ["h3", "libp2p"]
+    public var alpn: [String] = ["h3"]
 }
 
 /// A QUIC connection with multiplexed streams
@@ -315,60 +315,6 @@ public protocol QUICStream: Sendable {
 }
 ```
 
-## libp2p Integration
-
-For libp2p, QUIC transport needs special TLS configuration:
-
-### ALPN
-```swift
-// libp2p uses "libp2p" as ALPN
-config.alpn = ["libp2p"]
-```
-
-### Peer ID Authentication
-
-libp2p authenticates peers via a TLS extension containing the libp2p public key:
-
-```swift
-/// libp2p-specific TLS extension
-/// Extension type: 0x0f (reserved for private use)
-/// Payload: libp2p public key (protobuf encoded)
-public struct Libp2pTLSExtension: Sendable {
-    public static let extensionType: UInt16 = 0x0f
-    public let publicKey: Data  // Protobuf-encoded libp2p public key
-}
-```
-
-The certificate used must:
-1. Be self-signed
-2. Contain the libp2p public key in the extension
-3. The certificate's public key signs the libp2p public key
-
-### QUICTransport for libp2p
-
-```swift
-/// QUIC Transport for libp2p
-/// Implements the Transport protocol from P2PTransport
-public final class QUICTransport: Transport, Sendable {
-    public var protocols: [[String]] { [["ip4", "udp", "quic-v1"], ["ip6", "udp", "quic-v1"]] }
-
-    public func dial(_ address: Multiaddr) async throws -> any RawConnection {
-        // Returns QUICRawConnection (a wrapper that provides RawConnection interface)
-    }
-
-    public func listen(_ address: Multiaddr) async throws -> any Listener {
-        // Returns QUICListener
-    }
-}
-
-/// Wrapper to provide RawConnection interface for a QUICConnection
-/// Note: For QUIC, this is a "fake" RawConnection that actually provides
-/// multiplexed streams. The Security/Mux layers are bypassed.
-internal final class QUICRawConnection: RawConnection, Sendable {
-    // ...
-}
-```
-
 ## Implementation Phases
 
 ### Phase 1: Core Types (QUICCore) ✅
@@ -400,7 +346,6 @@ internal final class QUICRawConnection: RawConnection, Sendable {
 - [x] Session resumption (PSK)
 - [x] 0-RTT early data
 - [x] MockTLSProvider for testing (#if DEBUG guarded)
-- [ ] libp2p extension support (OID 1.3.6.1.4.1.53594.1.1)
 
 ### Phase 4: Connection Layer ✅
 - [x] Connection state machine
@@ -426,7 +371,6 @@ internal final class QUICRawConnection: RawConnection, Sendable {
 ### Phase 7: Integration
 - [ ] UDP transport integration (swift-nio-udp)
 - [ ] Public API (QUICClient, QUICListener)
-- [ ] libp2p Transport wrapper
 - [ ] Interoperability testing (quiche, quinn)
 
 ## Dependencies
@@ -450,7 +394,8 @@ dependencies: [
 - [RFC 9000: QUIC](https://www.rfc-editor.org/rfc/rfc9000.html)
 - [RFC 9001: QUIC-TLS](https://www.rfc-editor.org/rfc/rfc9001.html)
 - [RFC 9002: QUIC Loss Detection and Congestion Control](https://www.rfc-editor.org/rfc/rfc9002.html)
-- [libp2p QUIC spec](https://github.com/libp2p/specs/blob/master/quic/README.md)
+- [RFC 9114: HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html)
+- [RFC 9218: Extensible Prioritization Scheme for HTTP](https://www.rfc-editor.org/rfc/rfc9218.html)
 - [quiche (Cloudflare)](https://github.com/cloudflare/quiche) - Reference implementation
 - [quinn (Rust)](https://github.com/quinn-rs/quinn) - Another reference
 

@@ -717,7 +717,7 @@ public final class ClientStateMachine: Sendable {
             state.context.transcriptHash.update(with: message)
 
             // Call custom certificate validator if configured
-            // This is where libp2p validates the libp2p extension and extracts PeerID
+            // Custom validation hook (e.g., application-specific peer identity extraction)
             if let validator = state.configuration.certificateValidator,
                let peerCerts = state.context.peerCertificates {
                 let peerInfo = try validator(peerCerts)
@@ -995,7 +995,7 @@ public final class ClientStateMachine: Sendable {
     /// Validated peer info from certificate validator callback.
     ///
     /// This contains the value returned by `TLSConfiguration.certificateValidator`
-    /// after successful certificate validation (e.g., PeerID for libp2p).
+    /// after successful certificate validation (e.g., application-specific peer identity).
     public var validatedPeerInfo: (any Sendable)? {
         state.withLock { $0.context.validatedPeerInfo }
     }

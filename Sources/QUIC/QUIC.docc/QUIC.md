@@ -4,7 +4,7 @@ A pure Swift implementation of the QUIC protocol (RFC 9000).
 
 ## Overview
 
-swift-quic provides a modern, async/await-based QUIC implementation for Swift applications. It is designed primarily for libp2p integration but can be used as a standalone QUIC library.
+swift-quic provides a modern, async/await-based QUIC implementation for Swift applications, fully compliant with RFC 9000, RFC 9001, and RFC 9002.
 
 QUIC is a multiplexed transport protocol built on UDP that provides:
 - Encrypted connections by default (TLS 1.3)
