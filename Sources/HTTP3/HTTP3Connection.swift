@@ -236,6 +236,23 @@ public actor HTTP3Connection {
 
         state = .initializing
 
+        // 0. Wait for QUIC handshake to complete before opening streams.
+        //    Peer transport parameters (including stream limits) are only
+        //    available after the handshake finishes.  Without this wait,
+        //    openUniStream() will fail with streamLimitReached because the
+        //    peer's max_streams values are still 0.
+        let handshakeDeadline = ContinuousClock.now.advanced(by: .seconds(30))
+        while !quicConnection.isEstablished {
+            if ContinuousClock.now >= handshakeDeadline {
+                state = .closed
+                throw HTTP3Error(
+                    code: .internalError,
+                    reason: "QUIC handshake did not complete within timeout"
+                )
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
         // 1. Open control stream and send SETTINGS
         try await openControlStream()
 
@@ -486,18 +503,25 @@ public actor HTTP3Connection {
     /// Bidirectional streams are request streams. Unidirectional streams
     /// are classified by their stream type byte and routed accordingly.
     private func processIncomingStreams(from connection: any QUICConnectionProtocol) async {
+        print("[HTTP3Connection] processIncomingStreams started (role=\(role))")
         for await stream in connection.incomingStreams {
+            print("[HTTP3Connection] Received incoming stream id=\(stream.id), isUni=\(stream.isUnidirectional) (role=\(role))")
             if stream.isUnidirectional {
                 Task { [weak self] in
+                    print("[HTTP3Connection] handleIncomingUniStream task starting for stream \(stream.id)")
                     await self?.handleIncomingUniStream(stream)
+                    print("[HTTP3Connection] handleIncomingUniStream task finished for stream \(stream.id)")
                 }
             } else {
                 // Bidirectional stream = request stream
                 Task { [weak self] in
+                    print("[HTTP3Connection] handleIncomingRequestStream task starting for stream \(stream.id)")
                     await self?.handleIncomingRequestStream(stream)
+                    print("[HTTP3Connection] handleIncomingRequestStream task finished for stream \(stream.id)")
                 }
             }
         }
+        print("[HTTP3Connection] processIncomingStreams ended (role=\(role))")
     }
 
     // MARK: - Unidirectional Stream Handling
@@ -513,10 +537,16 @@ public actor HTTP3Connection {
             // Read the stream type (first varint on the stream)
             // We read a small amount — the varint is typically 1 byte,
             // but the read may also contain subsequent frame data.
+            print("[HTTP3Connection] handleIncomingUniStream: reading type from stream \(stream.id)")
             let typeData = try await stream.read()
-            guard !typeData.isEmpty else { return }
+            print("[HTTP3Connection] handleIncomingUniStream: got \(typeData.count) bytes from stream \(stream.id): \(typeData.map { String(format: "%02x", $0) }.joined())")
+            guard !typeData.isEmpty else {
+                print("[HTTP3Connection] handleIncomingUniStream: empty data from stream \(stream.id), returning")
+                return
+            }
 
             guard let (streamTypeValue, consumed) = try HTTP3StreamType.decode(from: typeData) else {
+                print("[HTTP3Connection] handleIncomingUniStream: failed to decode stream type from stream \(stream.id)")
                 return
             }
 
@@ -531,11 +561,13 @@ public actor HTTP3Connection {
             }
 
             let classification = HTTP3StreamClassification.classify(streamTypeValue)
+            print("[HTTP3Connection] handleIncomingUniStream: stream \(stream.id) classified as \(classification), remainingData=\(remainingData.count) bytes")
 
             switch classification {
             case .known(let streamType):
                 switch streamType {
                 case .control:
+                    print("[HTTP3Connection] handleIncomingUniStream: stream \(stream.id) is CONTROL stream, calling handleIncomingControlStream")
                     try await handleIncomingControlStream(stream, remainingData: remainingData)
                 case .qpackEncoder:
                     await handleIncomingQPACKEncoderStream(stream)
@@ -579,6 +611,7 @@ public actor HTTP3Connection {
         _ stream: any QUICStreamProtocol,
         remainingData: Data
     ) async throws {
+        print("[HTTP3Connection] handleIncomingControlStream: stream \(stream.id), remainingData=\(remainingData.count) bytes: \(remainingData.map { String(format: "%02x", $0) }.joined())")
         // Only one control stream per peer
         guard !peerControlStreamReceived else {
             throw HTTP3Error(
@@ -596,17 +629,22 @@ public actor HTTP3Connection {
         // Read the first frame — MUST be SETTINGS (RFC 9114 Section 6.2.1)
         // The SETTINGS frame may arrive across multiple reads, so we buffer
         // until a complete frame is available.
+        print("[HTTP3Connection] handleIncomingControlStream: reading SETTINGS frame (buffer=\(buffer.count) bytes)")
         let settingsFrame = try await readNextFrame(from: stream, buffer: &buffer)
+        print("[HTTP3Connection] handleIncomingControlStream: got frame: \(settingsFrame)")
 
         guard case .settings(let settings) = settingsFrame else {
+            print("[HTTP3Connection] handleIncomingControlStream: first frame is NOT settings: \(settingsFrame)")
             throw HTTP3Error.missingSettings
         }
 
+        print("[HTTP3Connection] handleIncomingControlStream: received peer SETTINGS: \(settings)")
         peerSettings = settings
 
         // Transition to ready state
         if state == .initializing {
             state = .ready
+            print("[HTTP3Connection] handleIncomingControlStream: state -> ready")
         }
 
         // Continue reading control frames

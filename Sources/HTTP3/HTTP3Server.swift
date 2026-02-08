@@ -344,6 +344,9 @@ public actor HTTP3Server {
             }
         } catch {
             // Connection initialization or processing failed
+            // Log the actual error so operators can diagnose the root cause
+            // (e.g. streamLimitReached if QUIC handshake wasn't complete)
+            print("[HTTP3Server] Connection error for \(quicConnection.remoteAddress): \(error)")
             // Close the connection with an appropriate error
             await h3Connection.close(error: .internalError)
         }

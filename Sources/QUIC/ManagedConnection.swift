@@ -77,6 +77,9 @@ public final class ManagedConnection: Sendable {
         /// Buffer for stream data received before read() is called
         var pendingData: [UInt64: [Data]] = [:]
         var isShutdown: Bool = false
+        /// Streams whose receive side is complete (FIN received, all data read).
+        /// Reads on these streams return empty `Data` to signal end-of-stream.
+        var finishedStreams: Set<UInt64> = []
     }
 
     /// Stream continuations for async stream API
@@ -870,6 +873,10 @@ public final class ManagedConnection: Sendable {
         }
 
         // Handle new peer-initiated streams
+        let scidForDebug = state.withLock { $0.sourceConnectionID }
+        if !result.newStreams.isEmpty {
+            print("[ManagedConnection] processFrameResult: \(result.newStreams.count) new streams: \(result.newStreams) for SCID=\(scidForDebug)")
+        }
         for streamID in result.newStreams {
             let isBidirectional = StreamID.isBidirectional(streamID)
             let stream = ManagedStream(
@@ -879,13 +886,18 @@ public final class ManagedConnection: Sendable {
             )
             incomingStreamState.withLock { state in
                 // Don't yield if shutdown
-                guard !state.isShutdown else { return }
+                guard !state.isShutdown else {
+                    print("[ManagedConnection] NOT yielding stream \(streamID) - shutdown for SCID=\(scidForDebug)")
+                    return
+                }
 
                 if let continuation = state.continuation {
                     // Continuation exists, yield directly
+                    print("[ManagedConnection] Yielding stream \(streamID) directly to continuation for SCID=\(scidForDebug)")
                     continuation.yield(stream)
                 } else {
                     // Buffer the stream until incomingStreams is accessed
+                    print("[ManagedConnection] Buffering stream \(streamID) (no continuation yet, pendingCount=\(state.pendingStreams.count)) for SCID=\(scidForDebug)")
                     state.pendingStreams.append(stream)
                 }
             }
@@ -896,6 +908,23 @@ public final class ManagedConnection: Sendable {
             notifyStreamDataReceived(streamID, data: data)
         }
 
+        // Handle streams whose receive side is now complete (FIN received,
+        // all data consumed).  If a reader is blocked waiting for more data
+        // on one of these streams, resume it with empty Data to signal
+        // end-of-stream.  Otherwise record the stream so that future
+        // readFromStream() calls return immediately.
+        for streamID in result.finishedStreams {
+            streamContinuationsState.withLock { state in
+                if let continuation = state.continuations.removeValue(forKey: streamID) {
+                    // A reader is already waiting — wake it with end-of-stream
+                    continuation.resume(returning: Data())
+                } else {
+                    // No reader yet — record so next readFromStream detects it
+                    state.finishedStreams.insert(streamID)
+                }
+            }
+        }
+
         // Handle handshake completion (from HANDSHAKE_DONE frame)
         if result.handshakeComplete {
             try completeHandshake()
@@ -903,7 +932,11 @@ public final class ManagedConnection: Sendable {
 
         // Handle connection close
         if result.connectionClosed {
-            state.withLock { $0.handshakeState = .closed }
+            let scid = state.withLock { s -> ConnectionID in
+                s.handshakeState = .closed
+                return s.sourceConnectionID
+            }
+            print("[ManagedConnection] shutdown() triggered by CONNECTION_CLOSE frame for SCID=\(scid)")
             shutdown()  // Finish async streams to prevent hanging for-await loops
         }
 
@@ -1131,12 +1164,16 @@ extension ManagedConnection: QUICConnectionProtocol {
     }
 
     public func close(error: UInt64?) async {
+        let scid = state.withLock { $0.sourceConnectionID }
+        print("[ManagedConnection] close(error: \(String(describing: error))) called for SCID=\(scid)")
         handler.close(error: error.map { ConnectionCloseError(code: $0) })
         state.withLock { $0.handshakeState = .closing }
         shutdown()
     }
 
     public func close(applicationError errorCode: UInt64, reason: String) async {
+        let scid = state.withLock { $0.sourceConnectionID }
+        print("[ManagedConnection] close(applicationError: \(errorCode), reason: \(reason)) called for SCID=\(scid)")
         handler.close(error: ConnectionCloseError(code: errorCode, reason: reason))
         state.withLock { $0.handshakeState = .closing }
         shutdown()
@@ -1153,7 +1190,6 @@ extension ManagedConnection: QUICConnectionProtocol {
     public func shutdown() {
         let scid = state.withLock { $0.sourceConnectionID }
         print("[ManagedConnection] shutdown() called for SCID=\(scid)")
-        Thread.callStackSymbols.prefix(15).forEach { print("  [shutdown] \($0)") }
 
         // Finish incoming stream continuation and mark as shutdown
         // Guard against concurrent calls - finish() is idempotent but we avoid duplicate work
@@ -1244,7 +1280,19 @@ extension ManagedConnection {
                     return
                 }
 
-                // Priority 3: Wait for data
+                // Priority 3: Check if stream receive side is complete (FIN)
+                // or was reset by the peer.  Return empty Data to signal
+                // end-of-stream so that callers break out of read loops.
+                if state.finishedStreams.contains(streamID)
+                    || handler.isStreamReceiveComplete(streamID)
+                    || handler.isStreamResetByPeer(streamID)
+                {
+                    state.finishedStreams.insert(streamID)
+                    continuation.resume(returning: Data())
+                    return
+                }
+
+                // Priority 4: Wait for data
                 // Prevent concurrent reads on the same stream
                 guard state.continuations[streamID] == nil else {
                     continuation.resume(throwing: ManagedConnectionError.invalidState("Concurrent read on stream \(streamID)"))

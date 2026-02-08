@@ -618,6 +618,26 @@ public final class StreamManager: Sendable {
         }
     }
 
+    /// Whether the receive side of a stream is complete (FIN received and all data read)
+    ///
+    /// Returns `true` when the peer has sent FIN and all contiguous data
+    /// has been consumed via `read()`.  Callers can use this to detect
+    /// end-of-stream without blocking.
+    public func isStreamReceiveComplete(streamID: UInt64) -> Bool {
+        state.withLock { state in
+            guard let stream = state.streams[streamID] else { return false }
+            return stream.isReceiveComplete
+        }
+    }
+
+    /// Whether the stream was reset by the peer (RESET_STREAM received)
+    public func isStreamResetByPeer(streamID: UInt64) -> Bool {
+        state.withLock { state in
+            guard let stream = state.streams[streamID] else { return false }
+            return stream.isResetByPeer
+        }
+    }
+
     /// Check if stream has data to send
     /// - Parameter streamID: Stream to check
     /// - Returns: true if data pending

@@ -250,20 +250,36 @@ public final class QUICConnectionHandler: Sendable {
             case .stream(let streamFrame):
                 // Check if this is a new peer-initiated stream
                 let isNewStream = !streamManager.hasStream(id: streamFrame.streamID)
+                let isRemote = isRemoteStream(streamFrame.streamID)
+                print("[QUICConnectionHandler] STREAM frame: streamID=\(streamFrame.streamID), isNew=\(isNewStream), isRemote=\(isRemote), dataLen=\(streamFrame.data.count), fin=\(streamFrame.fin)")
 
                 try streamManager.receive(frame: streamFrame)
 
                 // Track new peer-initiated streams
                 if isNewStream {
-                    let isRemote = isRemoteStream(streamFrame.streamID)
                     if isRemote {
+                        print("[QUICConnectionHandler] Adding streamID=\(streamFrame.streamID) to newStreams")
                         result.newStreams.append(streamFrame.streamID)
+                    } else {
+                        print("[QUICConnectionHandler] Skipping streamID=\(streamFrame.streamID) - locally initiated")
                     }
                 }
 
                 // Read available data from the stream
                 if let data = streamManager.read(streamID: streamFrame.streamID) {
+                    print("[QUICConnectionHandler] Read \(data.count) bytes from stream \(streamFrame.streamID)")
                     result.streamData.append((streamFrame.streamID, data))
+                } else {
+                    print("[QUICConnectionHandler] No data available from stream \(streamFrame.streamID) after receive")
+                }
+
+                // Check if the stream's receive side is now complete (FIN
+                // received and all contiguous data consumed).  Tracking this
+                // allows ManagedConnection to resume any blocked reader with
+                // an end-of-stream signal instead of letting it hang forever.
+                if streamManager.isStreamReceiveComplete(streamID: streamFrame.streamID) {
+                    print("[QUICConnectionHandler] Stream \(streamFrame.streamID) receive complete (FIN)")
+                    result.finishedStreams.append(streamFrame.streamID)
                 }
 
             case .resetStream(let resetFrame):
@@ -758,6 +774,19 @@ public final class QUICConnectionHandler: Sendable {
         streamManager.closeStream(id: streamID)
     }
 
+    /// Whether the receive side of a stream is complete (FIN received, all data read)
+    ///
+    /// Use this to detect end-of-stream without blocking.  Returns `true`
+    /// when the peer has sent FIN and all contiguous data has been consumed.
+    public func isStreamReceiveComplete(_ streamID: UInt64) -> Bool {
+        streamManager.isStreamReceiveComplete(streamID: streamID)
+    }
+
+    /// Whether the stream was reset by the peer (RESET_STREAM received)
+    public func isStreamResetByPeer(_ streamID: UInt64) -> Bool {
+        streamManager.isStreamResetByPeer(streamID: streamID)
+    }
+
     /// Checks if a stream has data to read
     /// - Parameter streamID: Stream to check
     /// - Returns: true if data available
@@ -987,6 +1016,13 @@ public struct FrameProcessingResult: Sendable {
 
     /// Whether the connection was closed
     public var connectionClosed: Bool = false
+
+    /// Streams whose receive side is now complete (FIN received, all data read)
+    ///
+    /// These streams will not produce any more data.  Readers that are
+    /// waiting for data on these streams should be woken with an
+    /// end-of-stream signal (empty `Data`).
+    public var finishedStreams: [UInt64] = []
 
     // MARK: - Connection Migration
 

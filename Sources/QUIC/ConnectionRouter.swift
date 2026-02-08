@@ -169,7 +169,6 @@ public final class ConnectionRouter: Sendable {
             return conns.count
         }
         print("[ConnectionRouter] UNREGISTER connection SCID=\(scid) removed CIDs: \(cids) (remaining: \(remainingCount))")
-        Thread.callStackSymbols.prefix(15).forEach { print("  \($0)") }
     }
 
     /// Unregisters specific connection IDs (without connection reference)

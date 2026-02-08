@@ -222,6 +222,28 @@ public final class DataStream: Sendable {
         _internal.withLock { $0.recvBuffer.contiguousBytesAvailable > 0 }
     }
 
+    /// Whether the receive side is complete (FIN received and all data read)
+    ///
+    /// Returns `true` when the peer has sent FIN and all contiguous data
+    /// has been consumed via `read()`.  Callers can use this to detect
+    /// end-of-stream without blocking.
+    public var isReceiveComplete: Bool {
+        _internal.withLock { `internal` in
+            // Stream received FIN and the application has read everything
+            `internal`.state.finReceived &&
+                (`internal`.state.recvState == .dataRead ||
+                 `internal`.state.recvState == .dataRecvd ||
+                 `internal`.recvBuffer.isComplete)
+        }
+    }
+
+    /// Whether the stream was reset by the peer
+    public var isResetByPeer: Bool {
+        _internal.withLock { `internal` in
+            `internal`.resetStreamReceived
+        }
+    }
+
     /// Bytes buffered for reading
     public var bufferedReadBytes: Int {
         _internal.withLock { $0.recvBuffer.bufferedBytes }

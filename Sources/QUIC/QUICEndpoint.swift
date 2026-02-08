@@ -59,6 +59,12 @@ public actor QUICEndpoint {
     /// Incoming connections (server mode)
     private var incomingConnectionContinuation: AsyncStream<any QUICConnectionProtocol>.Continuation?
 
+    /// Connections that have been created but not yet yielded to incomingConnections.
+    /// These are waiting for their QUIC handshake to complete so that peer transport
+    /// parameters (stream limits, flow control) are available before higher layers
+    /// (e.g. HTTP/3) attempt to open streams.
+    private var pendingConnections: Set<ObjectIdentifier> = []
+
     /// Send callback (for testing without real socket)
     private var sendCallback: (@Sendable (Data, SocketAddress) async throws -> Void)?
 
@@ -544,6 +550,15 @@ public actor QUICEndpoint {
                 try await send(response, to: remoteAddress)
             }
 
+            // Check if this connection was pending handshake completion.
+            // Multi-round-trip handshakes (e.g. TLS 1.3 with HRR) may
+            // require several packets before isEstablished becomes true.
+            let connID = ObjectIdentifier(connection)
+            if pendingConnections.contains(connID) && connection.isEstablished {
+                pendingConnections.remove(connID)
+                incomingConnectionContinuation?.yield(connection)
+            }
+
             return responses
 
         case .newConnection(let info):
@@ -558,6 +573,23 @@ public actor QUICEndpoint {
             // Send responses
             for response in responses {
                 try await send(response, to: remoteAddress)
+            }
+
+            // Yield to incomingConnections AFTER processDatagram completes.
+            // processDatagram processes the client's Initial CRYPTO frame,
+            // runs TLS, and (for most handshakes) completes the server-side
+            // handshake — which installs peer transport parameters and sets
+            // stream limits.  Yielding before this point causes higher layers
+            // (e.g. HTTP/3) to race and fail with streamLimitReached because
+            // peer limits are still 0.
+            if connection.isEstablished {
+                incomingConnectionContinuation?.yield(connection)
+            } else {
+                // Multi-round-trip handshake (rare with MockTLS, possible with
+                // real TLS 1.3 + HRR).  Track as pending — it will be yielded
+                // in the .routed branch once the handshake completes on a
+                // subsequent packet.
+                pendingConnections.insert(ObjectIdentifier(connection))
             }
 
             return responses
@@ -630,8 +662,14 @@ public actor QUICEndpoint {
         // Start handshake (server doesn't send first)
         _ = try await connection.start()
 
-        // Notify about new connection
-        incomingConnectionContinuation?.yield(connection)
+        // NOTE: Do NOT yield to incomingConnectionContinuation here.
+        // The handshake is not yet complete — peer transport parameters
+        // have not been received, so stream limits are all 0.
+        // If we yield now, higher layers (e.g. HTTP/3) will race to open
+        // streams and fail with streamLimitReached.
+        //
+        // Instead, the caller (processIncomingPacket) will yield the
+        // connection AFTER processDatagram() completes the handshake.
 
         return connection
     }
