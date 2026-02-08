@@ -332,6 +332,8 @@ public actor HTTP3Connection {
 
         // Open a new bidirectional stream
         let stream = try await quicConnection.openStream()
+        // Track the next client-initiated stream ID (increments by 4)
+        nextStreamID = stream.id &+ 4
 
         // Encode headers using QPACK
         let headerList = request.toHeaderList()
@@ -371,26 +373,16 @@ public actor HTTP3Connection {
         var responseHeaders: [(name: String, value: String)]?
         var bodyData = Data()
         var headersReceived = false
+        var buffer = Data()
+        var finished = false
 
-        // Read frames from the stream
         while true {
-            let data: Data
-            do {
-                data = try await stream.read()
-            } catch {
-                // Stream ended (FIN received) or error
-                break
-            }
+            while let frame = try popFrame(from: &buffer) {
+                if HTTP3ReservedFrameType.isReserved(frame.frameType) {
+                    await close(error: .frameUnexpected)
+                    throw HTTP3Error(code: .frameUnexpected, reason: "Reserved frame type on request stream")
+                }
 
-            if data.isEmpty {
-                // FIN received
-                break
-            }
-
-            // Decode frames from the received data
-            let (frames, _) = try HTTP3FrameCodec.decodeAll(from: data)
-
-            for frame in frames {
                 switch frame {
                 case .headers(let headerBlock):
                     if headersReceived {
@@ -413,11 +405,23 @@ public actor HTTP3Connection {
                 default:
                     // Other frame types on request streams are errors
                     if !frame.isAllowedOnRequestStream {
+                        await close(error: .frameUnexpected)
                         throw HTTP3Error.frameUnexpected(
                             "Frame type 0x\(String(frame.frameType, radix: 16)) not allowed on request stream"
                         )
                     }
                 }
+            }
+
+            if finished {
+                break
+            }
+
+            let chunk = try await stream.read()
+            if chunk.isEmpty {
+                finished = true
+            } else {
+                buffer.append(chunk)
             }
         }
 
@@ -470,6 +474,48 @@ public actor HTTP3Connection {
 
     // MARK: - Incoming Stream Processing
 
+    /// Pops the next complete HTTP/3 frame from the buffer if available.
+    private func popFrame(from buffer: inout Data) throws -> HTTP3Frame? {
+        guard let frameSize = HTTP3FrameCodec.peekFrameSize(from: buffer),
+              buffer.count >= frameSize else {
+            return nil
+        }
+
+        var offset = 0
+        let frame = try HTTP3FrameCodec.decode(from: buffer, offset: &offset)
+        buffer.removeFirst(offset)
+        return frame
+    }
+
+    /// Reads the next HTTP/3 frame from a stream, buffering partial data.
+    ///
+    /// - Parameters:
+    ///   - stream: The QUIC stream to read from
+    ///   - buffer: A buffer holding previously read (unconsumed) bytes
+    ///   - allowFin: Whether an empty read (FIN) is permitted
+    /// - Returns: The next frame, or `nil` if FIN is allowed and received
+    private func readNextFrame(
+        from stream: any QUICStreamProtocol,
+        buffer: inout Data,
+        allowFin: Bool
+    ) async throws -> HTTP3Frame? {
+        while true {
+            if let frame = try popFrame(from: &buffer) {
+                return frame
+            }
+
+            let chunk = try await stream.read()
+            if chunk.isEmpty {
+                if allowFin {
+                    return nil
+                }
+                throw HTTP3Error(code: .closedCriticalStream, reason: "Critical stream closed")
+            }
+
+            buffer.append(chunk)
+        }
+    }
+
     /// Processes incoming QUIC streams (both bidirectional and unidirectional).
     ///
     /// Bidirectional streams are request streams. Unidirectional streams
@@ -499,9 +545,11 @@ public actor HTTP3Connection {
             let typeData = try await stream.read(maxBytes: 8)
             guard !typeData.isEmpty else { return }
 
-            guard let (streamTypeValue, _) = try HTTP3StreamType.decode(from: typeData) else {
+            guard let (streamTypeValue, consumed) = try HTTP3StreamType.decode(from: typeData) else {
                 return
             }
+
+            let remainingData = Data(typeData.dropFirst(consumed))
 
             let classification = HTTP3StreamClassification.classify(streamTypeValue)
 
@@ -509,7 +557,7 @@ public actor HTTP3Connection {
             case .known(let streamType):
                 switch streamType {
                 case .control:
-                    try await handleIncomingControlStream(stream, remainingData: typeData)
+                    try await handleIncomingControlStream(stream, initialBuffer: remainingData)
                 case .qpackEncoder:
                     await handleIncomingQPACKEncoderStream(stream)
                 case .qpackDecoder:
@@ -534,7 +582,7 @@ public actor HTTP3Connection {
                 _ = try? await stream.read()
             }
         } catch {
-            // Stream read error — log and ignore
+            await close(error: .generalProtocolError)
         }
     }
 
@@ -544,29 +592,33 @@ public actor HTTP3Connection {
     /// frame, and then continues reading control frames (GOAWAY, etc.).
     private func handleIncomingControlStream(
         _ stream: any QUICStreamProtocol,
-        remainingData: Data
+        initialBuffer: Data
     ) async throws {
         // Only one control stream per peer
         guard !peerControlStreamReceived else {
-            throw HTTP3Error(
-                code: .streamCreationError,
-                reason: "Duplicate peer control stream"
-            )
+            await close(error: .streamCreationError)
+            return
         }
 
         peerControlStreamReceived = true
         peerControlStream = stream
 
-        // Read the first frame — MUST be SETTINGS
-        let firstFrameData = try await stream.read()
-        guard !firstFrameData.isEmpty else {
-            throw HTTP3Error.missingSettings
+        var buffer = initialBuffer
+
+        // First frame MUST be SETTINGS
+        guard let firstFrame = try await readNextFrame(from: stream, buffer: &buffer, allowFin: false) else {
+            await close(error: .missingSettings)
+            return
         }
 
-        let (frame, _) = try HTTP3FrameCodec.decode(from: firstFrameData)
+        if HTTP3ReservedFrameType.isReserved(firstFrame.frameType) {
+            await close(error: .frameUnexpected)
+            return
+        }
 
-        guard case .settings(let settings) = frame else {
-            throw HTTP3Error.missingSettings
+        guard case .settings(let settings) = firstFrame else {
+            await close(error: .missingSettings)
+            return
         }
 
         peerSettings = settings
@@ -577,56 +629,58 @@ public actor HTTP3Connection {
         }
 
         // Continue reading control frames
-        await readControlFrames(from: stream)
+        await readControlFrames(from: stream, buffer: &buffer)
     }
 
     /// Reads and processes control frames from the peer's control stream.
     ///
     /// This runs for the lifetime of the connection, processing GOAWAY
     /// and other control frames as they arrive.
-    private func readControlFrames(from stream: any QUICStreamProtocol) async {
+    private func readControlFrames(
+        from stream: any QUICStreamProtocol,
+        buffer: inout Data
+    ) async {
         while true {
             do {
-                let data = try await stream.read()
-                if data.isEmpty {
-                    // Control stream closed — this is a connection error
+                guard let frame = try await readNextFrame(from: stream, buffer: &buffer, allowFin: false) else {
                     await close(error: .closedCriticalStream)
                     return
                 }
 
-                let (frames, _) = try HTTP3FrameCodec.decodeAll(from: data)
+                if HTTP3ReservedFrameType.isReserved(frame.frameType) {
+                    await close(error: .frameUnexpected)
+                    return
+                }
 
-                for frame in frames {
-                    switch frame {
-                    case .goaway(let streamID):
-                        goawayStreamID = streamID
-                        state = .goingAway(lastStreamID: streamID)
+                switch frame {
+                case .goaway(let streamID):
+                    goawayStreamID = streamID
+                    state = .goingAway(lastStreamID: streamID)
 
-                    case .settings:
-                        // Duplicate SETTINGS is a connection error
+                case .settings:
+                    // Duplicate SETTINGS is a connection error
+                    await close(error: .frameUnexpected)
+                    return
+
+                case .maxPushID:
+                    // Only valid if we're a server
+                    if role != .server {
                         await close(error: .frameUnexpected)
                         return
-
-                    case .maxPushID:
-                        // Only valid if we're a server
-                        if role != .server {
-                            await close(error: .frameUnexpected)
-                            return
-                        }
-
-                    case .cancelPush:
-                        // Push cancellation — not implemented yet
-                        break
-
-                    case .data, .headers, .pushPromise:
-                        // These frames are NOT allowed on control streams
-                        await close(error: .frameUnexpected)
-                        return
-
-                    case .unknown:
-                        // Unknown frames on control stream are allowed
-                        break
                     }
+
+                case .cancelPush:
+                    // Push cancellation — not implemented yet
+                    break
+
+                case .data, .headers, .pushPromise:
+                    // These frames are NOT allowed on control streams
+                    await close(error: .frameUnexpected)
+                    return
+
+                case .unknown:
+                    // Unknown frames on control stream are allowed
+                    break
                 }
             } catch {
                 // Error reading from control stream
@@ -712,23 +766,16 @@ public actor HTTP3Connection {
             var requestHeaders: [(name: String, value: String)]?
             var bodyData = Data()
             var headersReceived = false
+            var buffer = Data()
+            var finished = false
 
-            // Accumulate data until FIN
             while true {
-                let data: Data
-                do {
-                    data = try await stream.read()
-                } catch {
-                    break
-                }
+                while let frame = try popFrame(from: &buffer) {
+                    if HTTP3ReservedFrameType.isReserved(frame.frameType) {
+                        await close(error: .frameUnexpected)
+                        return
+                    }
 
-                if data.isEmpty {
-                    break
-                }
-
-                let (frames, _) = try HTTP3FrameCodec.decodeAll(from: data)
-
-                for frame in frames {
                     switch frame {
                     case .headers(let headerBlock):
                         if headersReceived {
@@ -740,7 +787,8 @@ public actor HTTP3Connection {
 
                     case .data(let payload):
                         guard headersReceived else {
-                            throw HTTP3Error.frameUnexpected("DATA frame before HEADERS")
+                            await close(error: .frameUnexpected)
+                            return
                         }
                         bodyData.append(payload)
 
@@ -750,11 +798,21 @@ public actor HTTP3Connection {
 
                     default:
                         if !frame.isAllowedOnRequestStream {
-                            throw HTTP3Error.frameUnexpected(
-                                "Frame type 0x\(String(frame.frameType, radix: 16)) on request stream"
-                            )
+                            await close(error: .frameUnexpected)
+                            return
                         }
                     }
+                }
+
+                if finished {
+                    break
+                }
+
+                let chunk = try await stream.read()
+                if chunk.isEmpty {
+                    finished = true
+                } else {
+                    buffer.append(chunk)
                 }
             }
 

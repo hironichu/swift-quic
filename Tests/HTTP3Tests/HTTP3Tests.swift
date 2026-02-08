@@ -6,6 +6,7 @@
 import XCTest
 import Foundation
 @testable import HTTP3
+@testable import QUIC
 @testable import QUICCore
 @testable import QPACK
 
@@ -1302,4 +1303,206 @@ final class HTTP3ServerTests: XCTestCase {
         let serverSettings = await server.settings
         XCTAssertEqual(serverSettings.maxTableCapacity, 8192)
     }
+}
+
+// MARK: - HTTP/3 Connection Parsing Tests
+
+final class HTTP3ConnectionParsingTests: XCTestCase {
+
+    func testControlStreamUsesInitialBufferForSettings() async throws {
+        let quic = TestQUICConnection(
+            openUniStreams: [
+                TestQUICStream(id: 2, isUnidirectional: true),  // local control
+                TestQUICStream(id: 6, isUnidirectional: true)   // local qpack encoder
+            ]
+        )
+        let connection = HTTP3Connection(quicConnection: quic, role: .client)
+        try await connection.initialize()
+
+        let controlStream = TestQUICStream(id: 4, isUnidirectional: true)
+        // Stream type (0x00) + first byte of SETTINGS frame (type)
+        controlStream.enqueueRead(Data([0x00, 0x04]))
+        // Remaining SETTINGS length byte
+        controlStream.enqueueRead(Data([0x00]))
+        await quic.sendIncoming(controlStream)
+
+        try await connection.waitForReady(timeout: .milliseconds(200))
+        let peerSettings = await connection.peerSettings
+        XCTAssertNotNil(peerSettings)
+        XCTAssertEqual(peerSettings?.maxTableCapacity, 0)
+    }
+
+    func testRequestStreamHandlesFragmentedFrames() async throws {
+        let quic = TestQUICConnection(
+            openUniStreams: [
+                TestQUICStream(id: 2, isUnidirectional: true),  // local control
+                TestQUICStream(id: 6, isUnidirectional: true)   // local qpack encoder
+            ]
+        )
+        let connection = HTTP3Connection(quicConnection: quic, role: .server)
+        try await connection.initialize()
+
+        // Deliver peer control stream with SETTINGS
+        let controlStream = TestQUICStream(id: 4, isUnidirectional: true)
+        controlStream.enqueueRead(Data([0x00, 0x04, 0x00]))  // type=control + SETTINGS frame
+        await quic.sendIncoming(controlStream)
+        try await connection.waitForReady(timeout: .milliseconds(200))
+
+        // Build a simple request and encode frames
+        let request = HTTP3Request(method: .get, url: "https://example.com/", body: Data("hello".utf8))
+        let encoder = QPACKEncoder()
+        let headersBlock = encoder.encode(request.toHeaderList())
+        let headersFrame = HTTP3FrameCodec.encode(.headers(headersBlock))
+        let dataFrame = HTTP3FrameCodec.encode(.data(Data("hello".utf8)))
+
+        // Split frames across multiple reads to force buffering
+        let requestStream = TestQUICStream(id: 0, isUnidirectional: false)
+        requestStream.enqueueRead(Data(headersFrame.prefix(2)))
+        requestStream.enqueueRead(Data(headersFrame.dropFirst(2) + dataFrame.prefix(1)))
+        requestStream.enqueueRead(Data(dataFrame.dropFirst(1)))
+        await quic.sendIncoming(requestStream)
+
+        var iterator = await connection.incomingRequests.makeAsyncIterator()
+        let context = await iterator.next()
+
+        XCTAssertEqual(context?.request.method, .get)
+        XCTAssertEqual(context?.request.body, Data("hello".utf8))
+    }
+}
+
+// MARK: - Test Helpers
+
+final actor TestQUICStream: QUICStreamProtocol {
+    let id: UInt64
+    let isUnidirectional: Bool
+
+    private var iterator: AsyncStream<Data>.Iterator
+    private let continuation: AsyncStream<Data>.Continuation
+
+    var writes: [Data] = []
+    var resetCodes: [UInt64] = []
+
+    init(id: UInt64, isUnidirectional: Bool, initialReads: [Data] = []) {
+        self.id = id
+        self.isUnidirectional = isUnidirectional
+
+        var cont: AsyncStream<Data>.Continuation!
+        let stream = AsyncStream<Data> { continuation in
+            cont = continuation
+        }
+        self.iterator = stream.makeAsyncIterator()
+        self.continuation = cont
+
+        for chunk in initialReads {
+            cont.yield(chunk)
+        }
+    }
+
+    nonisolated var isBidirectional: Bool { !isUnidirectional }
+
+    func enqueueRead(_ data: Data) {
+        continuation.yield(data)
+    }
+
+    func finishReads() {
+        continuation.finish()
+    }
+
+    func read() async throws -> Data {
+        try await read(maxBytes: Int.max)
+    }
+
+    func read(maxBytes: Int) async throws -> Data {
+        guard let next = await iterator.next() else {
+            return Data()
+        }
+
+        if next.count > maxBytes {
+            let head = Data(next.prefix(maxBytes))
+            let tail = Data(next.dropFirst(maxBytes))
+            continuation.yield(tail)
+            return head
+        }
+
+        return next
+    }
+
+    func write(_ data: Data) async throws {
+        writes.append(data)
+    }
+
+    func closeWrite() async throws {}
+
+    func reset(errorCode: UInt64) async {
+        resetCodes.append(errorCode)
+    }
+
+    func stopSending(errorCode: UInt64) async throws {}
+}
+
+final actor TestQUICConnection: QUICConnectionProtocol {
+    var localAddress: SocketAddress? {
+        SocketAddress(ipAddress: "127.0.0.1", port: 4433)
+    }
+
+    var remoteAddress: SocketAddress {
+        SocketAddress(ipAddress: "127.0.0.1", port: 443)
+    }
+
+    var isEstablished: Bool { true }
+
+    private var openStreamsQueue: [TestQUICStream]
+    private var openUniStreamsQueue: [TestQUICStream]
+    private var nextBidirectionalID: UInt64
+
+    private let incomingContinuation: AsyncStream<any QUICStreamProtocol>.Continuation
+    let incomingStreams: AsyncStream<any QUICStreamProtocol>
+
+    init(
+        openStreams: [TestQUICStream] = [],
+        openUniStreams: [TestQUICStream] = [],
+        startingBidirectionalID: UInt64 = 0
+    ) {
+        self.openStreamsQueue = openStreams
+        self.openUniStreamsQueue = openUniStreams
+        self.nextBidirectionalID = startingBidirectionalID
+
+        var continuation: AsyncStream<any QUICStreamProtocol>.Continuation!
+        self.incomingStreams = AsyncStream<any QUICStreamProtocol> { cont in
+            continuation = cont
+        }
+        self.incomingContinuation = continuation
+    }
+
+    func sendIncoming(_ stream: TestQUICStream) {
+        incomingContinuation.yield(stream)
+    }
+
+    func finishIncoming() {
+        incomingContinuation.finish()
+    }
+
+    func openStream() async throws -> any QUICStreamProtocol {
+        if !openStreamsQueue.isEmpty {
+            return openStreamsQueue.removeFirst()
+        }
+
+        let stream = TestQUICStream(id: nextBidirectionalID, isUnidirectional: false)
+        nextBidirectionalID &+= 4
+        return stream
+    }
+
+    func openUniStream() async throws -> any QUICStreamProtocol {
+        if !openUniStreamsQueue.isEmpty {
+            return openUniStreamsQueue.removeFirst()
+        }
+
+        let stream = TestQUICStream(id: nextBidirectionalID, isUnidirectional: true)
+        nextBidirectionalID &+= 4
+        return stream
+    }
+
+    func close(error: UInt64?) async {}
+
+    func close(applicationError errorCode: UInt64, reason: String) async {}
 }
