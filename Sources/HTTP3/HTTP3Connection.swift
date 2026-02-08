@@ -516,12 +516,19 @@ public actor HTTP3Connection {
     private func handleIncomingUniStream(_ stream: any QUICStreamProtocol) async {
         do {
             // Read the stream type (first varint on the stream)
-            let typeData = try await stream.read(maxBytes: 8)
-            guard !typeData.isEmpty else { return }
+            // NOTE: We must read() without maxBytes to get all available data,
+            // because read(maxBytes:) consumes all data but only returns the first N bytes
+            let firstChunk = try await stream.read()
+            guard !firstChunk.isEmpty else { return }
 
-            guard let (streamTypeValue, _) = try HTTP3StreamType.decode(from: typeData) else {
+            guard let (streamTypeValue, bytesConsumed) = try HTTP3StreamType.decode(from: firstChunk) else {
                 return
             }
+
+            // Extract remaining data after stream type
+            let remainingData = firstChunk.count > bytesConsumed 
+                ? firstChunk.suffix(from: bytesConsumed)
+                : Data()
 
             let classification = HTTP3StreamClassification.classify(streamTypeValue)
 
@@ -529,7 +536,7 @@ public actor HTTP3Connection {
             case .known(let streamType):
                 switch streamType {
                 case .control:
-                    try await handleIncomingControlStream(stream, remainingData: typeData)
+                    try await handleIncomingControlStream(stream, firstFrameData: remainingData)
                 case .qpackEncoder:
                     await handleIncomingQPACKEncoderStream(stream)
                 case .qpackDecoder:
@@ -564,7 +571,7 @@ public actor HTTP3Connection {
     /// frame, and then continues reading control frames (GOAWAY, etc.).
     private func handleIncomingControlStream(
         _ stream: any QUICStreamProtocol,
-        remainingData: Data
+        firstFrameData: Data
     ) async throws {
         // Only one control stream per peer
         guard !peerControlStreamReceived else {
@@ -578,12 +585,13 @@ public actor HTTP3Connection {
         peerControlStream = stream
 
         // Read the first frame — MUST be SETTINGS
-        let firstFrameData = try await stream.read()
-        guard !firstFrameData.isEmpty else {
+        // Use firstFrameData if available (from stream type read), otherwise read more
+        let frameData = firstFrameData.isEmpty ? try await stream.read() : firstFrameData
+        guard !frameData.isEmpty else {
             throw HTTP3Error.missingSettings
         }
 
-        let (frame, _) = try HTTP3FrameCodec.decode(from: firstFrameData)
+        let (frame, bytesConsumed) = try HTTP3FrameCodec.decode(from: frameData)
 
         guard case .settings(let settings) = frame else {
             throw HTTP3Error.missingSettings
@@ -594,6 +602,16 @@ public actor HTTP3Connection {
         // Transition to ready state
         if state == .initializing {
             state = .ready
+        }
+
+        // If there's leftover data from the first read, we need to process it
+        // before continuing to read control frames
+        if bytesConsumed < frameData.count {
+            let leftoverData = frameData.suffix(from: bytesConsumed)
+            let (leftoverFrames, _) = try HTTP3FrameCodec.decodeAll(from: leftoverData)
+            for frame in leftoverFrames {
+                await processControlFrame(frame)
+            }
         }
 
         // Continue reading control frames
@@ -617,64 +635,64 @@ public actor HTTP3Connection {
                 let (frames, _) = try HTTP3FrameCodec.decodeAll(from: data)
 
                 for frame in frames {
-                    switch frame {
-                    case .goaway(let streamID):
-                        goawayStreamID = streamID
-                        state = .goingAway(lastStreamID: streamID)
-
-                    case .settings:
-                        // Duplicate SETTINGS is a connection error
-                        await close(error: .frameUnexpected)
-                        return
-
-                    case .maxPushID:
-                        // Only valid if we're a server
-                        if role != .server {
-                            await close(error: .frameUnexpected)
-                            return
-                        }
-
-                    case .priorityUpdateRequest(let streamID, let priority):
-                        // RFC 9218: Dynamic reprioritization of request streams
-                        // Only valid from a client (received by server)
-                        if role == .server {
-                            handlePriorityUpdate(streamID: streamID, priority: priority)
-                        } else {
-                            // Clients shouldn't receive request PRIORITY_UPDATE
-                            await close(error: .frameUnexpected)
-                            return
-                        }
-
-                    case .priorityUpdatePush(let pushID, let priority):
-                        // RFC 9218: Dynamic reprioritization of push streams
-                        // Only valid from a client (received by server)
-                        if role == .server {
-                            handlePriorityUpdate(streamID: pushID, priority: priority)
-                        } else {
-                            // Clients shouldn't receive push PRIORITY_UPDATE
-                            await close(error: .frameUnexpected)
-                            return
-                        }
-
-                    case .cancelPush:
-                        // Push cancellation — not implemented yet
-                        break
-
-                    case .data, .headers, .pushPromise:
-                        // These frames are NOT allowed on control streams
-                        await close(error: .frameUnexpected)
-                        return
-
-                    case .unknown:
-                        // Unknown frames on control stream are allowed
-                        break
-                    }
+                    await processControlFrame(frame)
                 }
             } catch {
                 // Error reading from control stream
                 await close(error: .closedCriticalStream)
                 return
             }
+        }
+    }
+
+    /// Process a control frame
+    private func processControlFrame(_ frame: HTTP3Frame) async {
+        switch frame {
+        case .goaway(let streamID):
+            goawayStreamID = streamID
+            state = .goingAway(lastStreamID: streamID)
+
+        case .settings:
+            // Duplicate SETTINGS is a connection error
+            await close(error: .frameUnexpected)
+
+        case .maxPushID:
+            // Only valid if we're a server
+            if role != .server {
+                await close(error: .frameUnexpected)
+            }
+
+        case .priorityUpdateRequest(let streamID, let priority):
+            // RFC 9218: Dynamic reprioritization of request streams
+            // Only valid from a client (received by server)
+            if role == .server {
+                handlePriorityUpdate(streamID: streamID, priority: priority)
+            } else {
+                // Clients shouldn't receive request PRIORITY_UPDATE
+                await close(error: .frameUnexpected)
+            }
+
+        case .priorityUpdatePush(let pushID, let priority):
+            // RFC 9218: Dynamic reprioritization of push streams
+            // Only valid from a client (received by server)
+            if role == .server {
+                handlePriorityUpdate(streamID: pushID, priority: priority)
+            } else {
+                // Clients shouldn't receive push PRIORITY_UPDATE
+                await close(error: .frameUnexpected)
+            }
+
+        case .cancelPush:
+            // Push cancellation — not implemented yet
+            break
+
+        case .data, .headers, .pushPromise:
+            // These frames are NOT allowed on control streams
+            await close(error: .frameUnexpected)
+
+        case .unknown:
+            // Unknown frames on control stream are allowed
+            break
         }
     }
 
