@@ -1,0 +1,888 @@
+# swift-quic Examples
+
+This directory contains runnable demo binaries that showcase the **QUIC** and **HTTP/3** APIs provided by the `swift-quic` library.
+
+---
+
+## Table of Contents
+
+- [Prerequisites](#prerequisites)
+- [Quick Start](#quick-start)
+- [QUICEchoServer — QUIC Protocol Demo](#quicechoserver--quic-protocol-demo)
+  - [Running the Echo Server](#running-the-echo-server)
+  - [Running the Echo Client](#running-the-echo-client)
+  - [QUIC API Reference](#quic-api-reference)
+- [HTTP3Demo — HTTP/3 Server & Client Demo](#http3demo--http3-server--client-demo)
+  - [Running the HTTP/3 Server](#running-the-http3-server)
+  - [Running the HTTP/3 Client](#running-the-http3-client)
+  - [HTTP/3 API Reference](#http3-api-reference)
+- [Architecture Overview](#architecture-overview)
+- [Security & TLS Configuration](#security--tls-configuration)
+- [Troubleshooting](#troubleshooting)
+
+---
+
+## Prerequisites
+
+- **Swift 6.2+** (swift-tools-version: 6.2)
+- **Linux** or **macOS** (both supported)
+- The examples use `MockTLSProvider` (testing mode, DEBUG builds only) — no certificates required for development
+
+Build the examples:
+
+```sh
+# Build everything
+swift build
+
+# Build only the QUIC echo server
+swift build --target QUICEchoServer
+
+# Build only the HTTP/3 demo
+swift build --target HTTP3Demo
+```
+
+---
+
+## Quick Start
+
+**Terminal 1** — Start the QUIC echo server:
+
+```sh
+swift run QUICEchoServer server
+```
+
+**Terminal 2** — Run the echo client:
+
+```sh
+swift run QUICEchoServer client
+```
+
+**Terminal 1** — Start the HTTP/3 server:
+
+```sh
+swift run HTTP3Demo server
+```
+
+**Terminal 2** — Run the HTTP/3 client demo:
+
+```sh
+swift run HTTP3Demo client
+```
+
+---
+
+## QUICEchoServer — QUIC Protocol Demo
+
+Demonstrates the **core QUIC transport API**: endpoints, connections, and streams.
+
+The server echoes back any data received on bidirectional streams. The client opens streams, sends messages, and reads the echoed responses.
+
+### Running the Echo Server
+
+```sh
+# Default: listens on 127.0.0.1:4433
+swift run QUICEchoServer server
+
+# Custom address
+swift run QUICEchoServer server --host 0.0.0.0 --port 5555
+```
+
+Output:
+
+```
+[2025-01-01T00:00:00Z] [Server] Starting QUIC Echo Server...
+[2025-01-01T00:00:00Z] [Server] Listening on 127.0.0.1:4433
+[2025-01-01T00:00:00Z] [Server] Waiting for connections...
+```
+
+### Running the Echo Client
+
+```sh
+# Default: connects to 127.0.0.1:4433
+swift run QUICEchoServer client
+
+# Custom address
+swift run QUICEchoServer client --host 192.168.1.10 --port 5555
+```
+
+Output:
+
+```
+[2025-01-01T00:00:01Z] [Client] Connected!
+[2025-01-01T00:00:01Z] [Client] Stream opened (ID: 0)
+[2025-01-01T00:00:01Z] [Client] [1/4] Sending: "Hello, QUIC!" (12 bytes)
+[2025-01-01T00:00:01Z] [Client] [1/4] Received echo: "Hello, QUIC!" (12 bytes)
+...
+[2025-01-01T00:00:01Z] [Client] All messages echoed successfully!
+```
+
+### QUIC API Reference
+
+#### QUICConfiguration
+
+Configuration holds all QUIC transport parameters. These are exchanged during the TLS handshake.
+
+```swift
+import QUIC
+
+// For production with real TLS certificates
+let config = QUICConfiguration.production {
+    MyTLSProvider(certPath: "/path/to/cert.pem", keyPath: "/path/to/key.pem")
+}
+
+// For development (self-signed certificates OK)
+let config = QUICConfiguration.development {
+    MyTLSProvider(allowSelfSigned: true)
+}
+
+// For testing/demos (no real encryption — DEBUG builds only)
+let config = QUICConfiguration.testing()
+```
+
+Key configuration properties:
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `alpn` | `[String]` | `["h3"]` | Application Layer Protocol Negotiation |
+| `maxIdleTimeout` | `Duration` | `.seconds(30)` | Close idle connections after this duration |
+| `initialMaxData` | `UInt64` | `10_000_000` | Connection-level flow control limit (bytes) |
+| `initialMaxStreamDataBidiLocal` | `UInt64` | `1_000_000` | Per-stream flow control (locally-initiated) |
+| `initialMaxStreamDataBidiRemote` | `UInt64` | `1_000_000` | Per-stream flow control (remotely-initiated) |
+| `initialMaxStreamsBidi` | `UInt64` | `100` | Max concurrent bidirectional streams |
+| `initialMaxStreamsUni` | `UInt64` | `100` | Max concurrent unidirectional streams |
+| `version` | `QUICVersion` | `.v1` | QUIC protocol version |
+| `maxUDPPayloadSize` | `Int` | `1200` | Maximum UDP datagram payload size |
+
+#### QUICEndpoint
+
+The top-level object that manages UDP I/O and QUIC connections.
+
+**Server mode:**
+
+```swift
+import QUICTransport
+import NIOUDPTransport
+
+// 1. Create UDP socket
+let socket = NIOQUICSocket(configuration: UDPConfiguration(
+    bindAddress: .specific(host: "0.0.0.0", port: 4433),
+    reuseAddress: true
+))
+
+// 2. Start endpoint with I/O loop
+let (endpoint, runTask) = try await QUICEndpoint.serve(
+    socket: socket,
+    configuration: config
+)
+
+// 3. Accept incoming connections
+for await connection in await endpoint.incomingConnections {
+    Task {
+        // Handle each connection concurrently
+        await handleConnection(connection)
+    }
+}
+
+// 4. Stop when done
+await endpoint.stop()
+runTask.cancel()
+```
+
+**Client mode:**
+
+```swift
+// 1. Create client endpoint
+let endpoint = QUICEndpoint(configuration: config)
+
+// 2. Dial the server (performs full QUIC handshake)
+let connection = try await endpoint.dial(
+    address: QUIC.SocketAddress(ipAddress: "127.0.0.1", port: 4433),
+    timeout: .seconds(10)
+)
+
+// connection.isEstablished == true at this point
+```
+
+#### QUICConnectionProtocol
+
+Represents a single QUIC connection (multiplexes many streams).
+
+```swift
+// Open a new bidirectional stream
+let stream = try await connection.openStream()
+
+// Open a unidirectional stream (send-only)
+let uniStream = try await connection.openUniStream()
+
+// Accept incoming streams from the remote peer
+for await stream in connection.incomingStreams {
+    Task { await handleStream(stream) }
+}
+
+// Close gracefully
+await connection.close(error: nil)
+
+// Close with an error code
+await connection.close(error: 0x01)
+
+// Close with application error and reason
+await connection.close(applicationError: 0x42, reason: "shutting down")
+```
+
+#### QUICStreamProtocol
+
+A single QUIC stream for sending/receiving data.
+
+```swift
+// Write data
+try await stream.write(Data("Hello".utf8))
+
+// Read data (suspends until data arrives)
+let data = try await stream.read()
+
+// Read with a byte limit
+let chunk = try await stream.read(maxBytes: 4096)
+
+// Close write side (sends FIN — signals end of data)
+try await stream.closeWrite()
+
+// Reset the stream with an error code
+await stream.reset(errorCode: 0x01)
+
+// Signal to the peer that you won't read any more
+try await stream.stopSending(errorCode: 0x00)
+
+// Inspect stream properties
+stream.id               // UInt64 — the stream ID
+stream.isBidirectional  // true for bidi streams
+stream.isUnidirectional // true for uni streams
+```
+
+**Stream ID encoding:**
+
+| Bits 0-1 | Type |
+|----------|------|
+| `0x00` | Client-initiated bidirectional |
+| `0x01` | Server-initiated bidirectional |
+| `0x02` | Client-initiated unidirectional |
+| `0x03` | Server-initiated unidirectional |
+
+Client bidi stream IDs: 0, 4, 8, 12, ...
+Server bidi stream IDs: 1, 5, 9, 13, ...
+
+#### NIOQUICSocket
+
+UDP socket backed by SwiftNIO for real network I/O.
+
+```swift
+import QUICTransport
+import NIOUDPTransport
+
+// Unicast (simple)
+let socket = NIOQUICSocket(configuration: .unicast(port: 4433))
+
+// Full configuration
+let socket = NIOQUICSocket(configuration: UDPConfiguration(
+    bindAddress: .specific(host: "0.0.0.0", port: 4433),
+    reuseAddress: true,
+    reusePort: false,
+    receiveBufferSize: 65536,
+    sendBufferSize: 65536,
+    maxDatagramSize: 65507,
+    streamBufferSize: 100
+))
+
+// Start and stop
+try await socket.start()
+await socket.stop()
+
+// I/O
+try await socket.send(data, to: address)
+for await packet in socket.incomingPackets {
+    // packet.data, packet.remoteAddress, packet.receivedAt
+}
+```
+
+---
+
+## HTTP3Demo — HTTP/3 Server & Client Demo
+
+Demonstrates the **HTTP/3 protocol layer** (RFC 9114) built on top of QUIC, including routing, request handling, QPACK header compression, and the full request/response lifecycle.
+
+### Running the HTTP/3 Server
+
+```sh
+# Default: listens on 127.0.0.1:4443
+swift run HTTP3Demo server
+
+# Custom address
+swift run HTTP3Demo server --host 0.0.0.0 --port 8443
+```
+
+Available routes:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/` | Welcome page (HTML) |
+| `GET` | `/health` | Health check (JSON) |
+| `GET` | `/info` | Server information (JSON) |
+| `POST` | `/echo` | Echo request body |
+| `POST` | `/api/json` | JSON echo API |
+| `GET` | `/headers` | Reflect request headers (JSON) |
+| `GET` | `/stream-info` | QUIC stream metadata (JSON) |
+| `ANY` | `/api/method` | HTTP method echo (JSON) |
+
+### Running the HTTP/3 Client
+
+```sh
+# Default: connects to 127.0.0.1:4443
+swift run HTTP3Demo client
+
+# Custom address
+swift run HTTP3Demo client --host 192.168.1.10 --port 8443
+```
+
+The client makes 7 demo requests showcasing different HTTP methods, headers, JSON payloads, and error handling (404).
+
+### HTTP/3 API Reference
+
+#### HTTP3Server
+
+Accepts QUIC connections and dispatches HTTP/3 requests to handlers.
+
+```swift
+import HTTP3
+
+// 1. Create server with settings
+let server = HTTP3Server(
+    settings: HTTP3Settings.literalOnly,
+    maxConnections: 100  // 0 = unlimited
+)
+
+// 2. Register a request handler
+await server.onRequest { context in
+    // context.request  — the HTTP3Request
+    // context.streamID — QUIC stream ID
+    // context.respond() — send a response
+    try await context.respond(HTTP3Response(
+        status: 200,
+        headers: [("content-type", "text/plain")],
+        body: Data("Hello, HTTP/3!".utf8)
+    ))
+}
+
+// 3. Feed QUIC connections to the server
+try await server.serve(connectionSource: endpoint.incomingConnections)
+
+// 4. Graceful shutdown
+await server.stop(gracePeriod: .seconds(5))
+```
+
+**Server properties:**
+
+```swift
+await server.activeConnectionCount  // Int
+await server.totalConnections       // UInt64 — total accepted
+await server.totalRequests          // UInt64 — total handled
+await server.isListening            // Bool
+await server.isStopped              // Bool
+```
+
+#### HTTP3Router
+
+Express.js-style path-based routing.
+
+```swift
+let router = HTTP3Router()
+
+// Route by HTTP method
+router.get("/") { context in
+    try await context.respond(HTTP3Response(status: 200, body: Data("Home".utf8)))
+}
+
+router.post("/api/data") { context in
+    let body = context.request.body ?? Data()
+    // Process body...
+    try await context.respond(HTTP3Response(status: 201))
+}
+
+router.put("/api/resource") { context in /* ... */ }
+router.delete("/api/resource") { context in /* ... */ }
+router.patch("/api/resource") { context in /* ... */ }
+
+// Route matching any HTTP method
+router.route("/api/anything") { context in
+    // context.request.method tells you which method was used
+}
+
+// Custom 404 handler
+router.setNotFound { context in
+    try await context.respond(HTTP3Response(
+        status: 404,
+        body: Data("Not Found".utf8)
+    ))
+}
+
+// Attach to server
+await server.onRequest(router.handler)
+```
+
+#### HTTP3Request
+
+Represents an incoming HTTP/3 request.
+
+```swift
+// Creating a request (client-side)
+let request = HTTP3Request(
+    method: .get,          // HTTPMethod enum
+    scheme: "https",       // Always "https" for HTTP/3
+    authority: "example.com:443",
+    path: "/api/data",
+    headers: [
+        ("accept", "application/json"),
+        ("user-agent", "swift-quic/0.1"),
+    ],
+    body: nil              // Data? — request body
+)
+
+// Convenience: create from URL string
+let request = HTTP3Request(
+    method: .post,
+    url: "https://example.com/api/data",
+    headers: [("content-type", "application/json")],
+    body: Data("{\"key\": \"value\"}".utf8)
+)
+
+// Accessing request properties (server-side)
+context.request.method      // .get, .post, .put, .delete, .patch, .head, .options, .connect, .trace
+context.request.scheme      // "https"
+context.request.authority   // "example.com:443"
+context.request.path        // "/api/data"
+context.request.headers     // [(String, String)]
+context.request.body        // Data?
+```
+
+#### HTTP3Response
+
+Represents an outgoing HTTP/3 response.
+
+```swift
+// Simple response
+let response = HTTP3Response(status: 200)
+
+// Full response
+let response = HTTP3Response(
+    status: 200,
+    headers: [
+        ("content-type", "application/json"),
+        ("cache-control", "no-cache"),
+        ("x-custom", "value"),
+    ],
+    body: Data("{\"ok\": true}".utf8)
+)
+
+// Status helpers
+response.isInformational  // 100-199
+response.isSuccess        // 200-299
+response.isRedirect       // 300-399
+response.isClientError    // 400-499
+response.isServerError    // 500-599
+response.statusText       // "OK", "Not Found", etc.
+```
+
+#### HTTP3RequestContext
+
+Wraps a request and a respond callback. Passed to request handlers.
+
+```swift
+await server.onRequest { context in
+    // Read the request
+    let method = context.request.method
+    let path = context.request.path
+    let streamID = context.streamID
+    
+    // Send a response (must be called exactly once)
+    try await context.respond(HTTP3Response(
+        status: 200,
+        headers: [("content-type", "text/plain")],
+        body: Data("OK".utf8)
+    ))
+}
+```
+
+#### HTTP3Settings
+
+Controls QPACK header compression and HTTP/3 connection behavior.
+
+```swift
+// Literal-only mode (simplest — no dynamic table)
+let settings = HTTP3Settings()  // or .literalOnly
+
+// With QPACK dynamic table (better compression)
+let settings = HTTP3Settings(
+    maxTableCapacity: 4096,       // Dynamic table size in bytes
+    maxFieldSectionSize: 65536,   // Max header block size
+    qpackBlockedStreams: 100      // Max blocked streams
+)
+
+// Predefined configurations
+HTTP3Settings.literalOnly          // No dynamic table (default)
+HTTP3Settings.smallDynamicTable    // 4 KB table, 64 KB headers, 100 blocked
+HTTP3Settings.largeDynamicTable    // 16 KB table, 256 KB headers, 200 blocked
+
+// Inspect settings
+settings.usesDynamicTable          // Bool
+settings.isLiteralOnly             // Bool
+settings.hasFieldSectionSizeLimit  // Bool
+```
+
+#### HTTP3Connection (Lower-Level API)
+
+For when you need direct control over the HTTP/3 connection.
+
+```swift
+// Wrap a QUIC connection in HTTP/3
+let h3conn = HTTP3Connection(
+    quicConnection: quicConnection,
+    role: .client,       // or .server
+    settings: HTTP3Settings.literalOnly
+)
+
+// Initialize (opens control + QPACK streams, sends SETTINGS)
+try await h3conn.initialize()
+
+// Wait for peer's SETTINGS frame
+try await h3conn.waitForReady(timeout: .seconds(5))
+
+// Send a request (client-side)
+let response = try await h3conn.sendRequest(
+    HTTP3Request(method: .get, scheme: "https", authority: "localhost:4443", path: "/")
+)
+
+// Accept incoming requests (server-side)
+for await context in await h3conn.incomingRequests {
+    // Handle request...
+}
+
+// Graceful shutdown
+try await h3conn.goaway(lastStreamID: 0)
+
+// Close
+await h3conn.close(error: .noError)
+
+// Properties
+await h3conn.isReady       // Bool — SETTINGS exchanged
+await h3conn.isGoingAway   // Bool — GOAWAY sent/received
+await h3conn.isClosed      // Bool
+```
+
+#### HTTP3Client (Connection-Pooling Client)
+
+High-level client with automatic connection management.
+
+```swift
+// Create client with a connection factory
+let client = HTTP3Client(
+    configuration: .default,
+    connectionFactory: { host, port in
+        let endpoint = QUICEndpoint(configuration: config)
+        return try await endpoint.dial(
+            address: QUIC.SocketAddress(ipAddress: host, port: port),
+            timeout: .seconds(10)
+        )
+    }
+)
+
+// Convenience methods
+let resp = try await client.get("https://example.com/api/data")
+let resp = try await client.post("https://example.com/api/submit",
+                                  body: Data("{\"key\":\"value\"}".utf8),
+                                  headers: [("content-type", "application/json")])
+let resp = try await client.put("https://example.com/api/resource",
+                                 body: updateData)
+let resp = try await client.delete("https://example.com/api/resource/42")
+
+// Full request control
+let request = HTTP3Request(method: .patch, url: "https://example.com/api/item/1",
+                           headers: [("content-type", "application/json")],
+                           body: patchData)
+let resp = try await client.request(request)
+
+// Connection pool management
+client.connectionCount        // Number of active connections
+client.connectedAuthorities   // ["example.com:443", ...]
+
+// Manual connection injection (for testing)
+await client.setConnection(h3conn, for: "example.com:443")
+
+// Clean up
+await client.close()
+```
+
+**Client Configuration:**
+
+```swift
+let client = HTTP3Client.build(connectionFactory: myFactory) { config in
+    config.settings = HTTP3Settings.smallDynamicTable
+    config.maxConcurrentRequests = 100
+    config.idleTimeout = .seconds(30)
+    config.autoRetry = true
+    config.maxConnections = 16
+}
+```
+
+#### HTTP3ErrorCode
+
+Standard HTTP/3 error codes (RFC 9114 Section 8.1).
+
+```swift
+HTTP3ErrorCode.noError                // 0x0100 — Graceful shutdown
+HTTP3ErrorCode.generalProtocolError   // 0x0101 — Protocol violation
+HTTP3ErrorCode.internalError          // 0x0102 — Internal error
+HTTP3ErrorCode.streamCreationError    // 0x0103 — Stream not allowed
+HTTP3ErrorCode.closedCriticalStream   // 0x0104 — Critical stream closed
+HTTP3ErrorCode.frameUnexpected        // 0x0105 — Unexpected frame
+HTTP3ErrorCode.frameError             // 0x0106 — Malformed frame
+HTTP3ErrorCode.excessiveLoad          // 0x0107 — Excessive load
+HTTP3ErrorCode.idError                // 0x0108 — Stream/push ID error
+HTTP3ErrorCode.settingsError          // 0x0109 — SETTINGS error
+HTTP3ErrorCode.missingSettings        // 0x010a — Missing SETTINGS
+HTTP3ErrorCode.requestRejected        // 0x010b — Request rejected (retryable)
+HTTP3ErrorCode.requestCancelled       // 0x010c — Request cancelled
+HTTP3ErrorCode.requestIncomplete      // 0x010d — Incomplete request
+HTTP3ErrorCode.messageError           // 0x010e — Malformed message
+HTTP3ErrorCode.connectError           // 0x010f — CONNECT failure
+HTTP3ErrorCode.versionFallback        // 0x0110 — Retry over HTTP/1.1
+```
+
+---
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Application Layer                                                  │
+│  ┌──────────────┐  ┌───────────────┐  ┌─────────────────────────┐  │
+│  │ HTTP3Server   │  │ HTTP3Client   │  │ HTTP3Router             │  │
+│  │ • onRequest() │  │ • get/post()  │  │ • get("/path") { ... }  │  │
+│  │ • serve()     │  │ • request()   │  │ • post("/path") { ... } │  │
+│  │ • stop()      │  │ • close()     │  │ • handler               │  │
+│  └───────┬───────┘  └───────┬───────┘  └─────────────────────────┘  │
+│          │                  │                                        │
+│  ┌───────┴──────────────────┴───────┐                               │
+│  │ HTTP3Connection                  │   ← HTTP/3 session state      │
+│  │ • Control stream (SETTINGS)      │                               │
+│  │ • QPACK encoder/decoder streams  │                               │
+│  │ • Request stream multiplexing    │                               │
+│  └──────────────┬───────────────────┘                               │
+├─────────────────┼───────────────────────────────────────────────────┤
+│  QPACK (RFC 9204)                                                   │
+│  │ QPACKEncoder: Encodes HTTP headers → compact binary              │
+│  │ QPACKDecoder: Decodes compact binary → HTTP headers              │
+│  │ Static table (99 entries) + optional dynamic table               │
+├─────────────────┼───────────────────────────────────────────────────┤
+│  QUIC Transport (RFC 9000)                                          │
+│  ┌──────────────┴───────────────────┐                               │
+│  │ QUICEndpoint                     │   ← UDP I/O + connection mgmt │
+│  │ ├── ConnectionRouter             │   ← Routes packets by DCID    │
+│  │ ├── TimerManager                 │   ← Loss detection timers     │
+│  │ └── VersionNegotiator            │   ← QUIC version negotiation  │
+│  └──────────────┬───────────────────┘                               │
+│  ┌──────────────┴───────────────────┐                               │
+│  │ ManagedConnection                │   ← One per QUIC connection   │
+│  │ ├── QUICConnectionHandler        │   ← Frame processing          │
+│  │ ├── PacketProcessor              │   ← Packet encoding/decoding  │
+│  │ ├── TLS13Provider                │   ← TLS 1.3 handshake         │
+│  │ ├── AntiAmplificationLimiter     │   ← DDoS protection           │
+│  │ └── StreamManager                │   ← Stream multiplexing       │
+│  └──────────────┬───────────────────┘                               │
+│  ┌──────────────┴───────────────────┐                               │
+│  │ NIOQUICSocket                    │   ← SwiftNIO UDP transport    │
+│  │ └── NIOUDPTransport              │                               │
+│  └──────────────────────────────────┘                               │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### HTTP/3 Connection Initialization Flow
+
+```
+Client                                          Server
+  │                                               │
+  │── QUIC Initial (ClientHello) ────────────────►│
+  │◄── QUIC Initial (ServerHello) ───────────────│
+  │◄── QUIC Handshake (EncryptedExtensions) ─────│
+  │── QUIC Handshake (Finished) ─────────────────►│
+  │                                               │
+  │  ═══ QUIC Connection Established ═══          │
+  │                                               │
+  │── Uni Stream: Control (type=0x00) ───────────►│
+  │── SETTINGS frame ────────────────────────────►│
+  │── Uni Stream: QPACK Encoder (type=0x02) ─────►│
+  │── Uni Stream: QPACK Decoder (type=0x03) ─────►│
+  │                                               │
+  │◄── Uni Stream: Control (type=0x00) ──────────│
+  │◄── SETTINGS frame ──────────────────────────│
+  │◄── Uni Stream: QPACK Encoder (type=0x02) ────│
+  │◄── Uni Stream: QPACK Decoder (type=0x03) ────│
+  │                                               │
+  │  ═══ HTTP/3 Connection Ready ═══              │
+  │                                               │
+  │── Bidi Stream 0: HEADERS (GET /) ────────────►│
+  │◄── Bidi Stream 0: HEADERS (200 OK) ─────────│
+  │◄── Bidi Stream 0: DATA (response body) ──────│
+  │◄── Bidi Stream 0: FIN ───────────────────────│
+  │                                               │
+  │── Bidi Stream 4: HEADERS (POST /api) ────────►│
+  │── Bidi Stream 4: DATA (request body) ────────►│
+  │── Bidi Stream 4: FIN ────────────────────────►│
+  │◄── Bidi Stream 4: HEADERS (201 Created) ─────│
+  │◄── Bidi Stream 4: FIN ───────────────────────│
+```
+
+### QUIC Stream Types in HTTP/3
+
+| Stream | Type Byte | Purpose |
+|--------|-----------|---------|
+| Control | `0x00` | SETTINGS, GOAWAY, MAX_PUSH_ID |
+| Push | `0x01` | Server push (not implemented) |
+| QPACK Encoder | `0x02` | Dynamic table updates |
+| QPACK Decoder | `0x03` | Dynamic table acknowledgments |
+| Request (bidi) | — | Client-initiated bidi streams for requests |
+
+---
+
+## Security & TLS Configuration
+
+### Testing Mode (This Demo)
+
+Both examples use `QUICConfiguration.testing()` which provides a `MockTLSProvider`. This is only available in **DEBUG** builds and provides **no real encryption**.
+
+```swift
+// ⚠️ DEBUG builds only — no encryption
+let config = QUICConfiguration.testing()
+```
+
+### Development Mode
+
+For development with self-signed certificates:
+
+```swift
+let config = QUICConfiguration.development {
+    // Your TLS provider that accepts self-signed certificates
+    MyTLSProvider(allowSelfSigned: true)
+}
+```
+
+### Production Mode
+
+For production deployments with proper TLS:
+
+```swift
+let config = QUICConfiguration.production {
+    // Your TLS 1.3 provider with valid certificates
+    MyTLSProvider(
+        certificatePath: "/etc/ssl/certs/fullchain.pem",
+        privateKeyPath: "/etc/ssl/private/privkey.pem"
+    )
+}
+```
+
+### Custom TLS Provider
+
+You can implement your own TLS 1.3 provider by conforming to the `TLS13Provider` protocol:
+
+```swift
+import QUICCrypto
+
+public final class MyTLSProvider: TLS13Provider, Sendable {
+    public func startHandshake(isClient: Bool) async throws -> [TLSOutput] { ... }
+    public func processHandshakeData(_ data: Data, at level: EncryptionLevel) async throws -> [TLSOutput] { ... }
+    public func getLocalTransportParameters() -> Data { ... }
+    public func setLocalTransportParameters(_ params: Data) throws { ... }
+    public func getPeerTransportParameters() -> Data? { ... }
+    public var isHandshakeComplete: Bool { ... }
+    public var isClient: Bool { ... }
+    public var negotiatedALPN: String? { ... }
+    // ... plus session resumption and 0-RTT methods
+}
+```
+
+---
+
+## Troubleshooting
+
+### "Connection refused" / Client can't connect
+
+Make sure the server is running first:
+
+```sh
+# Terminal 1
+swift run QUICEchoServer server
+
+# Terminal 2 (after server shows "Listening on ...")
+swift run QUICEchoServer client
+```
+
+### "TLS provider not configured"
+
+You're running in release mode, which doesn't have `MockTLSProvider`. Build in debug mode:
+
+```sh
+# Debug mode (default for `swift run`)
+swift run QUICEchoServer server
+
+# Explicitly debug
+swift build -c debug && .build/debug/QUICEchoServer server
+```
+
+### Build errors about NIOCore.SocketAddress
+
+If you see type conflicts between `SocketAddress` types, use the fully qualified name:
+
+```swift
+// Use QUIC's SocketAddress (takes UInt16 port)
+let addr = QUIC.SocketAddress(ipAddress: "127.0.0.1", port: 4433)
+
+// NIOCore's SocketAddress (takes Int port)
+let nioAddr = try NIOCore.SocketAddress(ipAddress: "127.0.0.1", port: 4433)
+```
+
+### Port already in use
+
+The default ports are 4433 (QUIC echo) and 4443 (HTTP/3). If they're in use:
+
+```sh
+swift run QUICEchoServer server --port 5555
+swift run HTTP3Demo server --port 8443
+```
+
+### Performance tips
+
+- Use `HTTP3Settings.smallDynamicTable` or `.largeDynamicTable` for better header compression on connections with many requests
+- Increase `initialMaxStreamsBidi` if you need more concurrent requests
+- Increase `initialMaxData` and `initialMaxStreamDataBidiLocal` for large file transfers
+- Set `maxIdleTimeout` appropriately to avoid keeping unused connections open
+
+---
+
+## Files
+
+```
+Examples/
+├── EXAMPLES.md                  ← This documentation
+├── QUICEchoServer/
+│   └── main.swift               ← QUIC echo server + client demo
+└── HTTP3Demo/
+    └── main.swift               ← HTTP/3 server + client demo
+```
+
+---
+
+## Related Documentation
+
+- [RFC 9000 — QUIC Transport](https://www.rfc-editor.org/rfc/rfc9000.html)
+- [RFC 9001 — QUIC TLS](https://www.rfc-editor.org/rfc/rfc9001.html)
+- [RFC 9002 — QUIC Loss Detection and Congestion Control](https://www.rfc-editor.org/rfc/rfc9002.html)
+- [RFC 9114 — HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html)
+- [RFC 9204 — QPACK](https://www.rfc-editor.org/rfc/rfc9204.html)
+- [RFC 9218 — Extensible Priorities for HTTP](https://www.rfc-editor.org/rfc/rfc9218.html)

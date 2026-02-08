@@ -26,6 +26,16 @@ let package = Package(
             name: "HTTP3",
             targets: ["HTTP3"]
         ),
+        // Example: QUIC Echo Server/Client
+        .executable(
+            name: "QUICEchoServer",
+            targets: ["QUICEchoServer"]
+        ),
+        // Example: HTTP/3 Demo Server/Client
+        .executable(
+            name: "HTTP3Demo",
+            targets: ["HTTP3Demo"]
+        ),
     ],
     dependencies: [
         // UDP transport
@@ -206,6 +216,32 @@ let package = Package(
                 "QUICCrypto",
             ],
             path: "Tests/QUICBenchmarks"
+        ),
+
+        // MARK: - Examples
+
+        .executableTarget(
+            name: "QUICEchoServer",
+            dependencies: [
+                "QUIC",
+                "QUICCore",
+                "QUICTransport",
+                .product(name: "NIOUDPTransport", package: "swift-nio-udp"),
+            ],
+            path: "Examples/QUICEchoServer"
+        ),
+
+        .executableTarget(
+            name: "HTTP3Demo",
+            dependencies: [
+                "QUIC",
+                "QUICCore",
+                "QUICTransport",
+                "HTTP3",
+                "QPACK",
+                .product(name: "NIOUDPTransport", package: "swift-nio-udp"),
+            ],
+            path: "Examples/HTTP3Demo"
         ),
     ]
 )
