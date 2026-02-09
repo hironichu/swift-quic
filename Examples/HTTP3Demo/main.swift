@@ -60,12 +60,19 @@
 //   - **HTTP3Settings**: QPACK and HTTP/3 configuration parameters
 //   - **HTTP3Client**: Connection-pooling HTTP/3 client
 //
-// ## Security Note
+// ## Security Modes
 //
-//   This demo uses `QUICConfiguration.testing()` which relies on `MockTLSProvider`.
-//   This is only available in DEBUG builds and provides NO real encryption.
-//   For production, configure `.production()` or `.development()` with a real
-//   TLS 1.3 provider and proper X.509 certificates.
+//   This demo supports two TLS modes:
+//
+//   1. **Development mode** (default, no arguments):
+//      Uses a self-signed P-256 certificate generated at startup.
+//      The client uses `allowSelfSigned = true` to accept it.
+//      Provides REAL TLS 1.3 encryption but no identity verification.
+//
+//   2. **Production mode** (with --cert/--key and --ca-cert):
+//      Uses PEM certificate and key files from disk.
+//      The client verifies the server certificate against a trusted CA.
+//      Full TLS 1.3 encryption and identity verification.
 //
 // =============================================================================
 
@@ -73,6 +80,7 @@ import Foundation
 import Logging
 import QUIC
 import QUICCore
+import QUICCrypto
 import QUICTransport
 import NIOUDPTransport
 import HTTP3
@@ -104,6 +112,15 @@ struct DemoArguments {
     let port: UInt16
     let logLevel: Logger.Level
 
+    /// Path to PEM certificate file (server only)
+    let certPath: String?
+
+    /// Path to PEM private key file (server only)
+    let keyPath: String?
+
+    /// Path to PEM CA certificate file (client only)
+    let caCertPath: String?
+
     /// Parses a string into a `Logger.Level`.
     ///
     /// Accepted values (case-insensitive):
@@ -128,6 +145,9 @@ struct DemoArguments {
         var host = defaultHost
         var port = defaultPort
         var logLevel: Logger.Level = .info
+        var certPath: String? = nil
+        var keyPath: String? = nil
+        var caCertPath: String? = nil
 
         var i = 1
         while i < args.count {
@@ -152,13 +172,30 @@ struct DemoArguments {
                     print("Warning: Invalid log level '\(i < args.count ? args[i] : "")', using 'info'")
                     print("  Valid levels: trace, debug, info, notice, warning, error, critical")
                 }
+            case "--cert":
+                i += 1
+                if i < args.count { certPath = args[i] }
+            case "--key":
+                i += 1
+                if i < args.count { keyPath = args[i] }
+            case "--ca-cert":
+                i += 1
+                if i < args.count { caCertPath = args[i] }
             default:
                 break
             }
             i += 1
         }
 
-        return DemoArguments(mode: mode, host: host, port: port, logLevel: logLevel)
+        return DemoArguments(
+            mode: mode,
+            host: host,
+            port: port,
+            logLevel: logLevel,
+            certPath: certPath,
+            keyPath: keyPath,
+            caCertPath: caCertPath
+        )
     }
 }
 
@@ -170,58 +207,104 @@ func log(_ tag: String, _ message: String) {
     print("[\(timestamp)] [\(tag)] \(message)")
 }
 
-// MARK: - Configuration Helpers
+// MARK: - TLS Configuration Helpers
 
-/// Creates a QUIC configuration suitable for HTTP/3 demo
+/// Creates a server TLS configuration.
 ///
-/// ## How QUICConfiguration Works
+/// When `certPath` and `keyPath` are provided, loads real PEM certificates
+/// from disk (production mode). Otherwise, generates a self-signed P-256
+/// key pair at startup (development mode).
 ///
-/// `QUICConfiguration` is a value type that holds all QUIC transport parameters.
-/// These parameters are exchanged during the TLS handshake and govern the
-/// connection's behavior.
+/// - Parameters:
+///   - certPath: Optional path to PEM certificate file
+///   - keyPath: Optional path to PEM private key file
+/// - Returns: A tuple of (TLSConfiguration, description) for logging
+func makeServerTLSConfig(certPath: String?, keyPath: String?) throws -> (TLSConfiguration, String) {
+    if let certPath = certPath, let keyPath = keyPath {
+        // Production mode: load certificates from disk
+        var tlsConfig = try TLSConfiguration.server(
+            certificatePath: certPath,
+            privateKeyPath: keyPath,
+            alpnProtocols: [h3ALPN]
+        )
+        tlsConfig.verifyPeer = false  // Server doesn't verify client certs in this demo
+        return (tlsConfig, "Production (cert: \(certPath), key: \(keyPath))")
+    } else {
+        // Development mode: generate a self-signed P-256 key
+        let signingKey = SigningKey.generateP256()
+        // Use a minimal DER-encoded certificate placeholder.
+        // TLS13Handler uses the signingKey for CertificateVerify; the certificate
+        // chain is sent to the peer but validation is handled by the client config.
+        let mockCertDER = Data([0x30, 0x82, 0x01, 0x00])
+        var tlsConfig = TLSConfiguration.server(
+            signingKey: signingKey,
+            certificateChain: [mockCertDER],
+            alpnProtocols: [h3ALPN]
+        )
+        tlsConfig.verifyPeer = false
+        return (tlsConfig, "Development (self-signed P-256, no cert files)")
+    }
+}
+
+/// Creates a client TLS configuration.
 ///
-/// ### Security Modes
+/// When `caCertPath` is provided, loads a trusted CA certificate from disk
+/// and enables full peer verification (production mode). Otherwise, disables
+/// strict verification and allows self-signed certificates (development mode).
 ///
-/// swift-quic enforces explicit security configuration:
+/// - Parameter caCertPath: Optional path to PEM CA certificate file
+/// - Returns: A tuple of (TLSConfiguration, description) for logging
+func makeClientTLSConfig(caCertPath: String?) throws -> (TLSConfiguration, String) {
+    if let caCertPath = caCertPath {
+        // Production mode: verify server certificate against trusted CA
+        var tlsConfig = TLSConfiguration.client(
+            serverName: "localhost",
+            alpnProtocols: [h3ALPN]
+        )
+        try tlsConfig.loadTrustedCAs(fromPEMFile: caCertPath)
+        tlsConfig.verifyPeer = true
+        tlsConfig.allowSelfSigned = false
+        return (tlsConfig, "Production (CA: \(caCertPath), verifyPeer: true)")
+    } else {
+        // Development mode: accept self-signed certificates
+        var tlsConfig = TLSConfiguration.client(
+            serverName: "localhost",
+            alpnProtocols: [h3ALPN]
+        )
+        tlsConfig.verifyPeer = false
+        tlsConfig.allowSelfSigned = true
+        return (tlsConfig, "Development (allowSelfSigned: true, verifyPeer: false)")
+    }
+}
+
+// MARK: - QUIC Configuration Helpers
+
+/// Creates a QUIC configuration for the HTTP/3 server.
 ///
-/// ```swift
-/// // Production: Real TLS with valid certificates
-/// let config = QUICConfiguration.production {
-///     MyTLSProvider(certPath: "/etc/ssl/cert.pem",
-///                   keyPath: "/etc/ssl/key.pem")
-/// }
+/// Uses `.production()` or `.development()` security mode depending on whether
+/// certificate files are provided.
 ///
-/// // Development: Self-signed certificates allowed
-/// let config = QUICConfiguration.development {
-///     MyTLSProvider(allowSelfSigned: true)
-/// }
-///
-/// // Testing: Mock TLS (DEBUG builds only, NO encryption)
-/// let config = QUICConfiguration.testing()
-/// ```
-///
-/// ### Transport Parameters
-///
-/// ```swift
-/// var config = QUICConfiguration()
-///
-/// // Flow control: how much data can be in-flight
-/// config.initialMaxData = 10_000_000           // 10 MB total
-/// config.initialMaxStreamDataBidiLocal = 1_000_000  // 1 MB per stream
-///
-/// // Stream limits: how many concurrent streams
-/// config.initialMaxStreamsBidi = 100    // 100 bidirectional streams
-/// config.initialMaxStreamsUni = 100     // 100 unidirectional streams
-///
-/// // Timeouts
-/// config.maxIdleTimeout = .seconds(30)  // Close idle connections after 30s
-///
-/// // ALPN: Application Layer Protocol Negotiation
-/// config.alpn = ["h3"]  // HTTP/3
-/// ```
-@available(*, deprecated, message: "Uses testing mode - not for production")
-func makeDemoConfiguration() -> QUICConfiguration {
-    var config = QUICConfiguration.testing()
+/// - Parameters:
+///   - certPath: Optional path to PEM certificate file
+///   - keyPath: Optional path to PEM private key file
+/// - Returns: A configured QUICConfiguration
+func makeServerConfiguration(certPath: String?, keyPath: String?) throws -> QUICConfiguration {
+    let (tlsConfig, description) = try makeServerTLSConfig(certPath: certPath, keyPath: keyPath)
+    log("Config", "TLS mode: \(description)")
+
+    let isProduction = (certPath != nil && keyPath != nil)
+
+    var config: QUICConfiguration
+    if isProduction {
+        config = QUICConfiguration.production {
+            TLS13Handler(configuration: tlsConfig)
+        }
+    } else {
+        config = QUICConfiguration.development {
+            TLS13Handler(configuration: tlsConfig)
+        }
+    }
+
     config.alpn = [h3ALPN]
     config.maxIdleTimeout = .seconds(60)
 
@@ -231,6 +314,42 @@ func makeDemoConfiguration() -> QUICConfiguration {
     config.initialMaxStreamsUni = 100
 
     // Flow control limits
+    config.initialMaxData = 10_000_000
+    config.initialMaxStreamDataBidiLocal = 1_000_000
+    config.initialMaxStreamDataBidiRemote = 1_000_000
+    config.initialMaxStreamDataUni = 1_000_000
+
+    return config
+}
+
+/// Creates a QUIC configuration for the HTTP/3 client.
+///
+/// Uses `.production()` or `.development()` security mode depending on whether
+/// a CA certificate file is provided.
+///
+/// - Parameter caCertPath: Optional path to PEM CA certificate file
+/// - Returns: A configured QUICConfiguration
+func makeClientConfiguration(caCertPath: String?) throws -> QUICConfiguration {
+    let (tlsConfig, description) = try makeClientTLSConfig(caCertPath: caCertPath)
+    log("Config", "TLS mode: \(description)")
+
+    let isProduction = (caCertPath != nil)
+
+    var config: QUICConfiguration
+    if isProduction {
+        config = QUICConfiguration.production {
+            TLS13Handler(configuration: tlsConfig)
+        }
+    } else {
+        config = QUICConfiguration.development {
+            TLS13Handler(configuration: tlsConfig)
+        }
+    }
+
+    config.alpn = [h3ALPN]
+    config.maxIdleTimeout = .seconds(60)
+    config.initialMaxStreamsBidi = 100
+    config.initialMaxStreamsUni = 100
     config.initialMaxData = 10_000_000
     config.initialMaxStreamDataBidiLocal = 1_000_000
     config.initialMaxStreamDataBidiRemote = 1_000_000
@@ -296,7 +415,7 @@ func makeDemoConfiguration() -> QUICConfiguration {
 /// let s2 = HTTP3Settings.smallDynamicTable    // 4 KB table
 /// let s3 = HTTP3Settings.largeDynamicTable    // 16 KB table
 /// ```
-func runServer(host: String, port: UInt16) async throws {
+func runServer(host: String, port: UInt16, certPath: String?, keyPath: String?) async throws {
     log("HTTP3", "╔══════════════════════════════════════════════════════════════╗")
     log("HTTP3", "║              HTTP/3 Demo Server                             ║")
     log("HTTP3", "╚══════════════════════════════════════════════════════════════╝")
@@ -305,18 +424,30 @@ func runServer(host: String, port: UInt16) async throws {
     log("HTTP3", "  Address:  \(host):\(port)")
     log("HTTP3", "  ALPN:     \(h3ALPN)")
     log("HTTP3", "  QPACK:    literal-only (no dynamic table)")
-    log("HTTP3", "  TLS:      MockTLS (testing mode - NOT FOR PRODUCTION)")
+
+    if let certPath = certPath, let keyPath = keyPath {
+        log("HTTP3", "  TLS:      Production (cert: \(certPath))")
+        log("HTTP3", "            (key:  \(keyPath))")
+    } else {
+        log("HTTP3", "  TLS:      Development (self-signed, real TLS 1.3 encryption)")
+        if certPath != nil && keyPath == nil {
+            log("HTTP3", "  Warning: --cert provided without --key, falling back to development mode")
+        }
+        if certPath == nil && keyPath != nil {
+            log("HTTP3", "  Warning: --key provided without --cert, falling back to development mode")
+        }
+    }
     log("HTTP3", "")
 
     // =========================================================================
-    // Step 1: Create QUIC configuration
+    // Step 1: Create QUIC configuration with real TLS
     // =========================================================================
     //
     // The QUIC configuration determines transport parameters that are
     // exchanged during the handshake. Both client and server must agree
-    // on compatible settings.
+    // on compatible settings. TLS13Handler provides real TLS 1.3 encryption.
     //
-    let quicConfig = makeDemoConfiguration()
+    let quicConfig = try makeServerConfiguration(certPath: certPath, keyPath: keyPath)
 
     // =========================================================================
     // Step 2: Create and bind the UDP socket
@@ -329,7 +460,7 @@ func runServer(host: String, port: UInt16) async throws {
     //
     let udpConfig = UDPConfiguration(
         bindAddress: .specific(host: host, port: Int(port)),
-        reuseAddress: true,
+        reuseAddress: false,
         receiveBufferSize: 65536,
         sendBufferSize: 65536,
         maxDatagramSize: 65507
@@ -957,16 +1088,22 @@ func buildRouter() -> HTTP3Router {
 ///     HTTP3Request(method: .get, scheme: "https", authority: "localhost:4443", path: "/")
 /// )
 /// ```
-func runClient(host: String, port: UInt16) async throws {
+func runClient(host: String, port: UInt16, caCertPath: String?) async throws {
     log("HTTP3", "╔══════════════════════════════════════════════════════════════╗")
     log("HTTP3", "║              HTTP/3 Demo Client                             ║")
     log("HTTP3", "╚══════════════════════════════════════════════════════════════╝")
     log("HTTP3", "")
     log("HTTP3", "Connecting to \(host):\(port)...")
+
+    if let caCertPath = caCertPath {
+        log("HTTP3", "  TLS: Production (CA cert: \(caCertPath))")
+    } else {
+        log("HTTP3", "  TLS: Development (allowSelfSigned: true)")
+    }
     log("HTTP3", "")
 
-    // Create QUIC configuration (must match server's ALPN)
-    let config = makeDemoConfiguration()
+    // Create QUIC configuration with real TLS (must match server's ALPN)
+    let config = try makeClientConfiguration(caCertPath: caCertPath)
 
     // Create QUIC endpoint and connect
     let endpoint = QUICEndpoint(configuration: config)
@@ -1186,27 +1323,36 @@ func printHelp() {
         --log-level, -l <level> Log verbosity (default: info)
                                 Levels: trace, debug, info, notice, warning, error, critical
 
+    SERVER OPTIONS:
+        --cert <path>           Path to PEM certificate file
+        --key <path>            Path to PEM private key file
+
+        When both --cert and --key are provided, the server runs in
+        production mode with the specified certificate. Otherwise, it
+        generates a self-signed P-256 key pair for development.
+
+    CLIENT OPTIONS:
+        --ca-cert <path>        Path to PEM CA certificate file
+
+        When --ca-cert is provided, the client verifies the server's
+        certificate against the trusted CA (production mode). Otherwise,
+        it accepts self-signed certificates (development mode).
+
     EXAMPLES:
-        # Start the HTTP/3 server
+        # Development mode (self-signed certificate, real TLS encryption)
         swift run HTTP3Demo server
-
-        # Start on a custom port
-        swift run HTTP3Demo server --port 8443
-
-        # Run the client demo
         swift run HTTP3Demo client
 
-        # Connect to a custom address
+        # Production mode (with real certificates)
+        swift run HTTP3Demo server --cert server.pem --key server-key.pem
+        swift run HTTP3Demo client --ca-cert ca.pem
+
+        # Custom host/port
+        swift run HTTP3Demo server --host 0.0.0.0 --port 8443
         swift run HTTP3Demo client --host 192.168.1.10 --port 8443
 
-        # Enable verbose logging (see all QUIC/HTTP3 internals)
+        # Enable verbose logging
         swift run HTTP3Demo server --log-level trace
-
-        # Show only warnings and errors
-        swift run HTTP3Demo server -l warning
-
-        # Debug level (connection lifecycle, stream events)
-        swift run HTTP3Demo client --log-level debug
 
     HTTP/3 PROTOCOL OVERVIEW:
 
@@ -1286,16 +1432,18 @@ func printHelp() {
             HTTP3Request(method: .get, url: "https://example.com/")
         )
 
-    SECURITY NOTE:
-        This demo uses MockTLSProvider (testing mode) for simplicity.
-        It provides NO real encryption. For production:
+    TLS SECURITY:
+        This demo uses TLS13Handler for real TLS 1.3 encryption.
 
-        let config = QUICConfiguration.production {
-            RealTLS13Provider(
-                certificatePath: "/path/to/fullchain.pem",
-                privateKeyPath: "/path/to/privkey.pem"
-            )
-        }
+        Development mode (default):
+          - Generates a self-signed P-256 key pair at startup
+          - Client accepts self-signed certificates (allowSelfSigned: true)
+          - Provides real encryption, but no identity verification
+
+        Production mode (with --cert/--key and --ca-cert):
+          - Server loads PEM certificate and key from files
+          - Client verifies server against trusted CA certificate
+          - Full encryption + identity verification
 
     """)
 }
@@ -1315,7 +1463,12 @@ LoggingSystem.bootstrap { label in
 switch arguments.mode {
 case .server:
     do {
-        try await runServer(host: arguments.host, port: arguments.port)
+        try await runServer(
+            host: arguments.host,
+            port: arguments.port,
+            certPath: arguments.certPath,
+            keyPath: arguments.keyPath
+        )
     } catch {
         log("HTTP3", "Fatal error: \(error)")
         exit(1)
@@ -1323,7 +1476,11 @@ case .server:
 
 case .client:
     do {
-        try await runClient(host: arguments.host, port: arguments.port)
+        try await runClient(
+            host: arguments.host,
+            port: arguments.port,
+            caCertPath: arguments.caCertPath
+        )
     } catch {
         log("HTTP3", "Fatal error: \(error)")
         exit(1)

@@ -406,6 +406,20 @@ public final class ManagedConnection: Sendable {
     /// Processes a coalesced datagram (multiple packets)
     /// - Parameter datagram: The UDP datagram
     /// - Returns: Outbound packets to send in response
+    ///
+    /// RFC 9000 Section 12.2: A single UDP datagram may contain multiple
+    /// coalesced QUIC packets at different encryption levels (e.g., Initial +
+    /// Handshake).  We MUST decrypt and process each packet incrementally so
+    /// that keys derived from processing one packet (e.g., the Initial packet
+    /// containing ServerHello, which installs Handshake keys) are available
+    /// when decrypting the next coalesced packet (e.g., the Handshake packet
+    /// containing EncryptedExtensions / Certificate / Finished).
+    ///
+    /// The previous implementation called `decryptDatagram()` up-front, which
+    /// tried to decrypt ALL coalesced packets before any frames were processed.
+    /// This caused the Handshake packet to be silently dropped (no keys yet),
+    /// losing the first 110 bytes of Handshake-level CRYPTO data and stalling
+    /// the TLS handshake.
     public func processDatagram(_ datagram: Data) async throws -> [Data] {
         // Record received bytes for anti-amplification limit
         amplificationLimiter.recordBytesReceived(UInt64(datagram.count))
@@ -416,17 +430,50 @@ public final class ManagedConnection: Sendable {
             return try await processRetryPacket(datagram)
         }
 
-        let parsedPackets = try packetProcessor.decryptDatagram(datagram)
-
-        // RFC 9000 Section 6.2: Mark that we've received a valid packet
-        // This prevents late Version Negotiation packets from being processed
-        if !parsedPackets.isEmpty {
-            state.withLock { $0.hasReceivedValidPacket = true }
+        // Step 1: Split the datagram into individual packet boundaries WITHOUT
+        // decrypting.  CoalescedPacketParser uses the Length field in long
+        // headers to find packet boundaries.
+        let dcidLen = packetProcessor.dcidLengthValue
+        let packetInfos: [CoalescedPacketParser.PacketInfo]
+        do {
+            packetInfos = try CoalescedPacketParser.parse(datagram: datagram, dcidLength: dcidLen)
+        } catch {
+            Self.logger.warning("Failed to parse coalesced datagram: \(error)")
+            return []
         }
 
         var allOutbound: [Data] = []
+        var processedAny = false
 
-        for parsed in parsedPackets {
+        // Step 2: Decrypt-then-process each packet sequentially.
+        // This ensures that keys installed by processing packet N are
+        // available when decrypting packet N+1.
+        for info in packetInfos {
+            // Attempt to decrypt this individual packet
+            let parsed: ParsedPacket
+            do {
+                parsed = try packetProcessor.decryptPacket(info.data)
+            } catch PacketCodecError.noOpener {
+                // No keys for this encryption level yet.
+                // This can still happen legitimately (e.g. 0-RTT keys not yet
+                // available).  Log at trace level and skip.
+                Self.logger.trace("Skipping coalesced packet at offset \(info.offset): no keys for this encryption level yet")
+                continue
+            } catch PacketCodecError.decryptionFailed {
+                // Decryption failed — packet may be corrupted or keys are wrong
+                Self.logger.trace("Skipping coalesced packet at offset \(info.offset): decryption failed")
+                continue
+            } catch QUICError.decryptionFailed {
+                // AEAD authentication tag mismatch
+                Self.logger.trace("Skipping coalesced packet at offset \(info.offset): AEAD decryption failed")
+                continue
+            } catch {
+                // Unexpected error — propagate
+                throw error
+            }
+
+            processedAny = true
+
             // RFC 9000 Section 7.2: Client MUST update DCID to server's SCID from first Initial packet
             // This is critical for QUIC handshake: client uses server's SCID as DCID in all subsequent packets
             if parsed.encryptionLevel == .initial, case .long(let longHeader) = parsed.header {
@@ -459,12 +506,21 @@ public final class ManagedConnection: Sendable {
                 receiveTime: .now
             )
 
-            // Process frames
+            // Process frames — this may call processFrameResult → processTLSOutputs,
+            // which installs new crypto keys (e.g., Handshake keys from ServerHello,
+            // Application keys from Finished).  These keys are now available for
+            // decrypting the next coalesced packet in the loop.
             let result = try handler.processFrames(parsed.frames, level: parsed.encryptionLevel)
 
             // Handle frame results (common logic)
             let outbound = try await processFrameResult(result)
             allOutbound.append(contentsOf: outbound)
+        }
+
+        // RFC 9000 Section 6.2: Mark that we've received a valid packet
+        // This prevents late Version Negotiation packets from being processed
+        if processedAny {
+            state.withLock { $0.hasReceivedValidPacket = true }
         }
 
         // Generate response packets
@@ -621,8 +677,13 @@ public final class ManagedConnection: Sendable {
         let outboundPackets = handler.getOutboundPackets()
         var result: [Data] = []
 
-        // Group packets by level for coalescing
-        var packetsByLevel: [EncryptionLevel: [(frames: [Frame], header: PacketHeader, packetNumber: UInt64)]] = [:]
+        // Consolidate all frames by encryption level into a single packet
+        // per level.  Previously each frame was wrapped in its own
+        // OutboundPacket, leading to many tiny packets (one per CRYPTO
+        // frame, one per ACK, etc.).  Consolidating reduces packet count,
+        // saves packet numbers, and ensures the peer receives all handshake
+        // CRYPTO data in a single packet that can be processed atomically.
+        var framesByLevel: [EncryptionLevel: [Frame]] = [:]
 
         for packet in outboundPackets {
             // Skip levels whose keys have already been discarded.
@@ -634,62 +695,49 @@ public final class ManagedConnection: Sendable {
                 continue
             }
 
-            let pn = handler.getNextPacketNumber(for: packet.level)
-            let header = buildPacketHeader(for: packet.level, packetNumber: pn)
-
-            packetsByLevel[packet.level, default: []].append((
-                frames: packet.frames,
-                header: header,
-                packetNumber: pn
-            ))
+            framesByLevel[packet.level, default: []].append(contentsOf: packet.frames)
         }
 
-        // Try to coalesce Initial + Handshake packets
-        let hasInitial = packetsByLevel[.initial] != nil
-        let hasHandshake = packetsByLevel[.handshake] != nil
+        // Build one packet per encryption level (ordering: Initial, Handshake, Application)
 
-        if hasInitial {
-            // Build Initial packets (will be padded to 1200 bytes)
-            for packet in packetsByLevel[.initial]! {
-                if case .long(let longHeader) = packet.header {
-                    let encrypted = try packetProcessor.encryptLongHeaderPacket(
-                        frames: packet.frames,
-                        header: longHeader,
-                        packetNumber: packet.packetNumber,
-                        padToMinimum: true
-                    )
-                    result.append(encrypted)
-                }
+        if let initialFrames = framesByLevel[.initial], !initialFrames.isEmpty {
+            let pn = handler.getNextPacketNumber(for: .initial)
+            let header = buildPacketHeader(for: .initial, packetNumber: pn)
+            if case .long(let longHeader) = header {
+                let encrypted = try packetProcessor.encryptLongHeaderPacket(
+                    frames: initialFrames,
+                    header: longHeader,
+                    packetNumber: pn,
+                    padToMinimum: true
+                )
+                result.append(encrypted)
             }
         }
 
-        if hasHandshake {
-            // Build Handshake packets separately
-            // (Can't coalesce with Initial since Initial is padded to 1200)
-            for packet in packetsByLevel[.handshake]! {
-                if case .long(let longHeader) = packet.header {
-                    let encrypted = try packetProcessor.encryptLongHeaderPacket(
-                        frames: packet.frames,
-                        header: longHeader,
-                        packetNumber: packet.packetNumber,
-                        padToMinimum: false
-                    )
-                    result.append(encrypted)
-                }
+        if let handshakeFrames = framesByLevel[.handshake], !handshakeFrames.isEmpty {
+            let pn = handler.getNextPacketNumber(for: .handshake)
+            let header = buildPacketHeader(for: .handshake, packetNumber: pn)
+            if case .long(let longHeader) = header {
+                let encrypted = try packetProcessor.encryptLongHeaderPacket(
+                    frames: handshakeFrames,
+                    header: longHeader,
+                    packetNumber: pn,
+                    padToMinimum: false
+                )
+                result.append(encrypted)
             }
         }
 
-        // Build 1-RTT packets separately (they shouldn't be coalesced with Initial/Handshake)
-        if let appPackets = packetsByLevel[.application] {
-            for packet in appPackets {
-                if case .short(let shortHeader) = packet.header {
-                    let encrypted = try packetProcessor.encryptShortHeaderPacket(
-                        frames: packet.frames,
-                        header: shortHeader,
-                        packetNumber: packet.packetNumber
-                    )
-                    result.append(encrypted)
-                }
+        if let appFrames = framesByLevel[.application], !appFrames.isEmpty {
+            let pn = handler.getNextPacketNumber(for: .application)
+            let header = buildPacketHeader(for: .application, packetNumber: pn)
+            if case .short(let shortHeader) = header {
+                let encrypted = try packetProcessor.encryptShortHeaderPacket(
+                    frames: appFrames,
+                    header: shortHeader,
+                    packetNumber: pn
+                )
+                result.append(encrypted)
             }
         }
 
@@ -737,8 +785,12 @@ public final class ManagedConnection: Sendable {
             case .handshakeData(let data, let level):
                 // Queue CRYPTO frames
                 handler.queueCryptoData(data, level: level)
-                // Signal that packets need to be sent
-                signalNeedsSend()
+                // NOTE: Do NOT call signalNeedsSend() here.
+                // The inline path (generateOutboundPackets at the end of this
+                // method) will build and return these packets directly.
+                // Signaling the outboundSendLoop here causes a race where
+                // the loop drains partially-queued frames, splitting handshake
+                // CRYPTO data across competing senders and losing packets.
 
             case .keysAvailable(let info):
                 // Install keys via PacketProcessor (single source of truth for crypto)
@@ -775,7 +827,8 @@ public final class ManagedConnection: Sendable {
                 if role == .server {
                     handler.queueFrame(.handshakeDone, level: .application)
                     Self.logger.debug("Server queued HANDSHAKE_DONE frame")
-                    signalNeedsSend()
+                    // NOTE: Do NOT signal here — the inline generateOutboundPackets()
+                    // below will pick up HANDSHAKE_DONE along with all other queued frames.
                 }
 
                 // Mark handshake as established, drain waiters, and propagate 0-RTT result
@@ -820,9 +873,18 @@ public final class ManagedConnection: Sendable {
             }
         }
 
-        // Generate packets from queued frames (BEFORE discarding keys)
+        // Generate packets from queued frames (BEFORE discarding keys).
+        // This is the ONLY place that should drain the outbound queue during
+        // TLS processing — no signalNeedsSend() was issued above, so the
+        // outboundSendLoop is not competing for the queue.
         let packets = try generateOutboundPackets()
         outboundPackets.append(contentsOf: packets)
+
+        // Now signal the outboundSendLoop so it's ready for any future
+        // packets (e.g. post-handshake stream data, session tickets).
+        // At this point the queue has been drained, so the loop will find
+        // nothing immediately — but it will be primed for the next write.
+        signalNeedsSend()
 
         // Discard Initial and Handshake keys if handshake completed
         // RFC 9001 Section 4.9.2:

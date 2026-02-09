@@ -230,6 +230,7 @@ let package = Package(
             dependencies: [
                 "QUIC",
                 "QUICCore",
+                "QUICCrypto",
                 "QUICTransport",
                 .product(name: "NIOUDPTransport", package: "swift-nio-udp"),
                 .product(name: "Logging", package: "swift-log"),
@@ -242,6 +243,7 @@ let package = Package(
             dependencies: [
                 "QUIC",
                 "QUICCore",
+                "QUICCrypto",
                 "QUICTransport",
                 "HTTP3",
                 "QPACK",

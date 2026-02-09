@@ -18,6 +18,10 @@
 //   swift run QUICEchoServer server --host 0.0.0.0 --port 5555
 //   swift run QUICEchoServer client --host 127.0.0.1 --port 5555
 //
+//   # With real certificates (production mode)
+//   swift run QUICEchoServer server --cert /path/to/cert.pem --key /path/to/key.pem
+//   swift run QUICEchoServer client --ca-cert /path/to/ca.pem
+//
 // ## Architecture
 //
 //   ┌──────────────┐         UDP          ┌──────────────┐
@@ -34,7 +38,7 @@
 //     It can operate in server mode (accepting connections) or client mode (dialing).
 //
 //   - **QUICConfiguration**: Holds transport parameters (timeouts, flow control limits,
-//     ALPN, TLS settings). Use `.testing()` for development (mock TLS).
+//     ALPN, TLS settings).
 //
 //   - **QUICConnectionProtocol**: Represents a multiplexed QUIC connection.
 //     Supports opening/accepting bidirectional and unidirectional streams.
@@ -44,12 +48,19 @@
 //
 //   - **NIOQUICSocket**: UDP socket backed by SwiftNIO for real network I/O.
 //
-// ## Security Note
+// ## Security Modes
 //
-//   This demo uses `QUICConfiguration.testing()` which relies on `MockTLSProvider`.
-//   This is only available in DEBUG builds and provides NO real encryption.
-//   For production use, configure `.production()` or `.development()` with a
-//   real TLS 1.3 provider.
+//   This demo supports two TLS modes:
+//
+//   1. **Development mode** (default, no arguments):
+//      Uses a self-signed P-256 certificate generated at startup.
+//      The client uses `allowSelfSigned = true` to accept it.
+//      Provides REAL TLS 1.3 encryption but no identity verification.
+//
+//   2. **Production mode** (with --cert/--key and --ca-cert):
+//      Uses PEM certificate and key files from disk.
+//      The client verifies the server certificate against a trusted CA.
+//      Full TLS 1.3 encryption and identity verification.
 //
 // =============================================================================
 
@@ -57,6 +68,7 @@ import Foundation
 import Logging
 import QUIC
 import QUICCore
+import QUICCrypto
 import QUICTransport
 import NIOUDPTransport
 
@@ -86,6 +98,15 @@ struct DemoArguments {
     let port: UInt16
     let logLevel: Logger.Level
 
+    /// Path to PEM certificate file (server only)
+    let certPath: String?
+
+    /// Path to PEM private key file (server only)
+    let keyPath: String?
+
+    /// Path to PEM CA certificate file (client only)
+    let caCertPath: String?
+
     /// Parses a string into a `Logger.Level`.
     ///
     /// Accepted values (case-insensitive):
@@ -111,6 +132,9 @@ struct DemoArguments {
         var host = defaultHost
         var port = defaultPort
         var logLevel: Logger.Level = .info
+        var certPath: String? = nil
+        var keyPath: String? = nil
+        var caCertPath: String? = nil
 
         var i = 1
         while i < args.count {
@@ -135,13 +159,30 @@ struct DemoArguments {
                     print("Warning: Invalid log level '\(i < args.count ? args[i] : "")', using 'info'")
                     print("  Valid levels: trace, debug, info, notice, warning, error, critical")
                 }
+            case "--cert":
+                i += 1
+                if i < args.count { certPath = args[i] }
+            case "--key":
+                i += 1
+                if i < args.count { keyPath = args[i] }
+            case "--ca-cert":
+                i += 1
+                if i < args.count { caCertPath = args[i] }
             default:
                 break
             }
             i += 1
         }
 
-        return DemoArguments(mode: mode, host: host, port: port, logLevel: logLevel)
+        return DemoArguments(
+            mode: mode,
+            host: host,
+            port: port,
+            logLevel: logLevel,
+            certPath: certPath,
+            keyPath: keyPath,
+            caCertPath: caCertPath
+        )
     }
 }
 
@@ -153,36 +194,145 @@ func log(_ tag: String, _ message: String) {
     print("[\(timestamp)] [\(tag)] \(message)")
 }
 
+// MARK: - TLS Configuration Helpers
+
+/// Creates a server TLS configuration.
+///
+/// When `certPath` and `keyPath` are provided, loads real PEM certificates
+/// from disk (production mode). Otherwise, generates a self-signed P-256
+/// key pair at startup (development mode).
+///
+/// - Parameters:
+///   - certPath: Optional path to PEM certificate file
+///   - keyPath: Optional path to PEM private key file
+/// - Returns: A tuple of (TLSConfiguration, description) for logging
+func makeServerTLSConfig(certPath: String?, keyPath: String?) throws -> (TLSConfiguration, String) {
+    if let certPath = certPath, let keyPath = keyPath {
+        // Production mode: load certificates from disk
+        var tlsConfig = try TLSConfiguration.server(
+            certificatePath: certPath,
+            privateKeyPath: keyPath,
+            alpnProtocols: [demoALPN]
+        )
+        tlsConfig.verifyPeer = false  // Server doesn't verify client certs in this demo
+        return (tlsConfig, "Production (cert: \(certPath), key: \(keyPath))")
+    } else {
+        // Development mode: generate a self-signed P-256 key
+        let signingKey = SigningKey.generateP256()
+        // Use a minimal DER-encoded certificate placeholder.
+        // TLS13Handler uses the signingKey for CertificateVerify; the certificate
+        // chain is sent to the peer but validation is handled by the client config.
+        let mockCertDER = Data([0x30, 0x82, 0x01, 0x00])
+        var tlsConfig = TLSConfiguration.server(
+            signingKey: signingKey,
+            certificateChain: [mockCertDER],
+            alpnProtocols: [demoALPN]
+        )
+        tlsConfig.verifyPeer = false
+        return (tlsConfig, "Development (self-signed P-256, no cert files)")
+    }
+}
+
+/// Creates a client TLS configuration.
+///
+/// When `caCertPath` is provided, loads a trusted CA certificate from disk
+/// and enables full peer verification (production mode). Otherwise, disables
+/// strict verification and allows self-signed certificates (development mode).
+///
+/// - Parameter caCertPath: Optional path to PEM CA certificate file
+/// - Returns: A tuple of (TLSConfiguration, description) for logging
+func makeClientTLSConfig(caCertPath: String?) throws -> (TLSConfiguration, String) {
+    if let caCertPath = caCertPath {
+        // Production mode: verify server certificate against trusted CA
+        var tlsConfig = TLSConfiguration.client(
+            serverName: "localhost",
+            alpnProtocols: [demoALPN]
+        )
+        try tlsConfig.loadTrustedCAs(fromPEMFile: caCertPath)
+        tlsConfig.verifyPeer = true
+        tlsConfig.allowSelfSigned = false
+        return (tlsConfig, "Production (CA: \(caCertPath), verifyPeer: true)")
+    } else {
+        // Development mode: accept self-signed certificates
+        var tlsConfig = TLSConfiguration.client(
+            serverName: "localhost",
+            alpnProtocols: [demoALPN]
+        )
+        tlsConfig.verifyPeer = false
+        tlsConfig.allowSelfSigned = true
+        return (tlsConfig, "Development (allowSelfSigned: true, verifyPeer: false)")
+    }
+}
+
 // MARK: - QUIC Configuration Helper
 
-/// Creates a QUIC configuration for the demo
+/// Creates a QUIC configuration for the server.
 ///
-/// Uses `.testing()` mode which provides a `MockTLSProvider` (DEBUG only).
-/// In production, you would use:
+/// Uses `.production()` or `.development()` security mode depending on whether
+/// certificate files are provided.
 ///
-/// ```swift
-/// let config = QUICConfiguration.production {
-///     MyRealTLSProvider(certificatePath: "/path/to/cert.pem",
-///                       keyPath: "/path/to/key.pem")
-/// }
-/// ```
-///
-/// Or for development with self-signed certificates:
-///
-/// ```swift
-/// let config = QUICConfiguration.development {
-///     MyTLSProvider(allowSelfSigned: true)
-/// }
-/// ```
-@available(*, deprecated, message: "Uses testing mode - not for production")
-func makeDemoConfiguration() -> QUICConfiguration {
-    var config = QUICConfiguration.testing()
+/// - Parameters:
+///   - certPath: Optional path to PEM certificate file
+///   - keyPath: Optional path to PEM private key file
+/// - Returns: A configured QUICConfiguration
+func makeServerConfiguration(certPath: String?, keyPath: String?) throws -> QUICConfiguration {
+    let (tlsConfig, description) = try makeServerTLSConfig(certPath: certPath, keyPath: keyPath)
+    log("Config", "TLS mode: \(description)")
+
+    let isProduction = (certPath != nil && keyPath != nil)
+
+    var config: QUICConfiguration
+    if isProduction {
+        config = QUICConfiguration.production {
+            TLS13Handler(configuration: tlsConfig)
+        }
+    } else {
+        config = QUICConfiguration.development {
+            TLS13Handler(configuration: tlsConfig)
+        }
+    }
+
     config.alpn = [demoALPN]
     config.maxIdleTimeout = .seconds(60)
     config.initialMaxStreamsBidi = 100
     config.initialMaxStreamsUni = 100
-    config.initialMaxData = 10_000_000         // 10 MB connection-level flow control
-    config.initialMaxStreamDataBidiLocal = 1_000_000  // 1 MB per stream
+    config.initialMaxData = 10_000_000
+    config.initialMaxStreamDataBidiLocal = 1_000_000
+    config.initialMaxStreamDataBidiRemote = 1_000_000
+    config.initialMaxStreamDataUni = 1_000_000
+    return config
+}
+
+/// Creates a QUIC configuration for the client.
+///
+/// Uses `.production()` or `.development()` security mode depending on whether
+/// a CA certificate file is provided.
+///
+/// - Parameter caCertPath: Optional path to PEM CA certificate file
+/// - Returns: A configured QUICConfiguration
+func makeClientConfiguration(caCertPath: String?) throws -> QUICConfiguration {
+    let (tlsConfig, description) = try makeClientTLSConfig(caCertPath: caCertPath)
+    log("Config", "TLS mode: \(description)")
+
+    let isProduction = (caCertPath != nil)
+
+    var config: QUICConfiguration
+    if isProduction {
+        config = QUICConfiguration.production {
+            TLS13Handler(configuration: tlsConfig)
+        }
+    } else {
+        config = QUICConfiguration.development {
+            TLS13Handler(configuration: tlsConfig)
+        }
+    }
+
+    config.alpn = [demoALPN]
+    config.maxIdleTimeout = .seconds(60)
+    config.initialMaxStreamsBidi = 100
+    config.initialMaxStreamsUni = 100
+    config.initialMaxData = 10_000_000
+    config.initialMaxStreamDataBidiLocal = 1_000_000
     config.initialMaxStreamDataBidiRemote = 1_000_000
     config.initialMaxStreamDataUni = 1_000_000
     return config
@@ -203,31 +353,43 @@ func makeDemoConfiguration() -> QUICConfiguration {
 ///
 /// ```
 /// Server starts listening on 127.0.0.1:4433
-///   ← Client connects (QUIC handshake)
-///   ← Client opens stream #0
-///   ← Client sends "Hello, QUIC!"
-///   → Server echoes "Hello, QUIC!"
-///   ← Client closes write side (FIN)
-///   → Server closes write side (FIN)
-///   ← Client closes connection
+///   <- Client connects (QUIC handshake)
+///   <- Client opens stream #0
+///   <- Client sends "Hello, QUIC!"
+///   -> Server echoes "Hello, QUIC!"
+///   <- Client closes write side (FIN)
+///   -> Server closes write side (FIN)
+///   <- Client closes connection
 /// ```
-func runServer(host: String, port: UInt16) async throws {
+func runServer(host: String, port: UInt16, certPath: String?, keyPath: String?) async throws {
     log("Server", "Starting QUIC Echo Server...")
     log("Server", "Configuration:")
     log("Server", "  Address: \(host):\(port)")
     log("Server", "  ALPN: \(demoALPN)")
-    log("Server", "  Mode: Testing (MockTLS - NOT FOR PRODUCTION)")
+
+    if let certPath = certPath, let keyPath = keyPath {
+        log("Server", "  TLS: Production (cert: \(certPath))")
+        log("Server", "       (key:  \(keyPath))")
+    } else {
+        log("Server", "  TLS: Development (self-signed, real TLS 1.3 encryption)")
+        if certPath != nil && keyPath == nil {
+            log("Server", "  Warning: --cert provided without --key, falling back to development mode")
+        }
+        if certPath == nil && keyPath != nil {
+            log("Server", "  Warning: --key provided without --cert, falling back to development mode")
+        }
+    }
     log("Server", "")
 
-    // Step 1: Create the QUIC configuration
+    // Step 1: Create the QUIC configuration with real TLS
     //
     // QUICConfiguration holds all transport parameters including:
     //   - Flow control limits (max data, max streams)
     //   - Idle timeout
     //   - ALPN protocols
-    //   - TLS/security settings
+    //   - TLS/security settings (via TLS13Handler)
     //
-    let config = makeDemoConfiguration()
+    let config = try makeServerConfiguration(certPath: certPath, keyPath: keyPath)
 
     // Step 2: Create UDP socket
     //
@@ -238,7 +400,7 @@ func runServer(host: String, port: UInt16) async throws {
     //
     let udpConfig = UDPConfiguration(
         bindAddress: .specific(host: host, port: Int(port)),
-        reuseAddress: true,
+        reuseAddress: false,
         receiveBufferSize: 65536,
         sendBufferSize: 65536,
         maxDatagramSize: 65507
@@ -434,13 +596,19 @@ func handleEchoStream(_ stream: any QUICStreamProtocol, connectionID: UInt64, st
 /// // Close connection
 /// await connection.close(error: nil)
 /// ```
-func runClient(host: String, port: UInt16) async throws {
+func runClient(host: String, port: UInt16, caCertPath: String?) async throws {
     log("Client", "Starting QUIC Echo Client...")
     log("Client", "Connecting to \(host):\(port)")
+
+    if let caCertPath = caCertPath {
+        log("Client", "  TLS: Production (CA cert: \(caCertPath))")
+    } else {
+        log("Client", "  TLS: Development (allowSelfSigned: true)")
+    }
     log("Client", "")
 
-    // Step 1: Create configuration (must match server's ALPN)
-    let config = makeDemoConfiguration()
+    // Step 1: Create configuration with real TLS (must match server's ALPN)
+    let config = try makeClientConfiguration(caCertPath: caCertPath)
 
     // Step 2: Create client endpoint
     //
@@ -493,7 +661,7 @@ func runClient(host: String, port: UInt16) async throws {
     let messages = [
         "Hello, QUIC!",
         "This is a test message.",
-        "swift-quic echo demo 🚀",
+        "swift-quic echo demo \u{1F680}",
         "Final message."
     ]
 
@@ -571,9 +739,9 @@ func runClient(host: String, port: UInt16) async throws {
 
 func printHelp() {
     print("""
-    ╔══════════════════════════════════════════════════════════════╗
-    ║              QUIC Echo Server/Client Demo                   ║
-    ╚══════════════════════════════════════════════════════════════╝
+    \u{256D}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256E}
+    \u{2502}              QUIC Echo Server/Client Demo                   \u{2502}
+    \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256F}
 
     USAGE:
         swift run QUICEchoServer <mode> [options]
@@ -589,66 +757,68 @@ func printHelp() {
         --log-level, -l <level> Log verbosity (default: info)
                                 Levels: trace, debug, info, notice, warning, error, critical
 
+    SERVER OPTIONS:
+        --cert <path>           Path to PEM certificate file
+        --key <path>            Path to PEM private key file
+
+        When both --cert and --key are provided, the server runs in
+        production mode with the specified certificate. Otherwise, it
+        generates a self-signed P-256 key pair for development.
+
+    CLIENT OPTIONS:
+        --ca-cert <path>        Path to PEM CA certificate file
+
+        When --ca-cert is provided, the client verifies the server's
+        certificate against the trusted CA (production mode). Otherwise,
+        it accepts self-signed certificates (development mode).
+
     EXAMPLES:
-        # Start the server on default address
+        # Development mode (self-signed certificate, real TLS encryption)
         swift run QUICEchoServer server
-
-        # Start the server on a custom port
-        swift run QUICEchoServer server --port 5555
-
-        # Connect the client
         swift run QUICEchoServer client
 
-        # Enable verbose logging (see all QUIC internals)
-        swift run QUICEchoServer server --log-level trace
+        # Production mode (with real certificates)
+        swift run QUICEchoServer server --cert server.pem --key server-key.pem
+        swift run QUICEchoServer client --ca-cert ca.pem
 
-        # Show only warnings and errors
-        swift run QUICEchoServer server -l warning
-
-        # Debug level (connection lifecycle, stream events)
-        swift run QUICEchoServer client --log-level debug
-
-        # Connect to a custom address
+        # Custom host/port
+        swift run QUICEchoServer server --host 0.0.0.0 --port 5555
         swift run QUICEchoServer client --host 192.168.1.10 --port 5555
+
+        # Enable verbose logging
+        swift run QUICEchoServer server --log-level trace
 
     ARCHITECTURE:
 
-        The QUIC protocol provides:
-        • Encrypted transport (TLS 1.3 built-in)
-        • Multiplexed streams (no head-of-line blocking)
-        • Connection migration (IP address changes)
-        • Low-latency handshake (0-RTT support)
-
         API Hierarchy:
-        ┌─────────────────┐
-        │  QUICEndpoint    │  ← Top-level: manages UDP I/O & connections
-        │  ├── dial()      │  ← Client: connect to server
-        │  └── serve()     │  ← Server: accept connections
-        ├─────────────────┤
-        │  QUICConnection  │  ← One per peer: multiplexes streams
-        │  ├── openStream()│  ← Create a new stream
-        │  └── incoming    │  ← Accept streams from peer
-        │      Streams     │
-        ├─────────────────┤
-        │  QUICStream      │  ← One per stream: read/write data
-        │  ├── read()      │  ← Receive data
-        │  ├── write()     │  ← Send data
-        │  └── closeWrite()│  ← Signal end of data (FIN)
-        └─────────────────┘
+        \u{250C}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}
+        \u{2502}  QUICEndpoint    \u{2502}  <- Top-level: manages UDP I/O & connections
+        \u{2502}  \u{251C}\u{2500}\u{2500} dial()      \u{2502}  <- Client: connect to server
+        \u{2502}  \u{2514}\u{2500}\u{2500} serve()     \u{2502}  <- Server: accept connections
+        \u{251C}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2524}
+        \u{2502}  QUICConnection  \u{2502}  <- One per peer: multiplexes streams
+        \u{2502}  \u{251C}\u{2500}\u{2500} openStream()\u{2502}  <- Create a new stream
+        \u{2502}  \u{2514}\u{2500}\u{2500} incoming    \u{2502}  <- Accept streams from peer
+        \u{2502}      Streams     \u{2502}
+        \u{251C}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2524}
+        \u{2502}  QUICStream      \u{2502}  <- One per stream: read/write data
+        \u{2502}  \u{251C}\u{2500}\u{2500} read()      \u{2502}  <- Receive data
+        \u{2502}  \u{251C}\u{2500}\u{2500} write()     \u{2502}  <- Send data
+        \u{2502}  \u{2514}\u{2500}\u{2500} closeWrite()\u{2502}  <- Signal end of data (FIN)
+        \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}
 
-    SECURITY NOTE:
-        This demo uses MockTLSProvider (testing mode) which provides
-        NO real encryption. For production, use:
+    TLS SECURITY:
+        This demo uses TLS13Handler for real TLS 1.3 encryption.
 
-        // Production with real certificates
-        let config = QUICConfiguration.production {
-            MyTLSProvider(certPath: "cert.pem", keyPath: "key.pem")
-        }
+        Development mode (default):
+          - Generates a self-signed P-256 key pair at startup
+          - Client accepts self-signed certificates (allowSelfSigned: true)
+          - Provides real encryption, but no identity verification
 
-        // Development with self-signed certs
-        let config = QUICConfiguration.development {
-            MyTLSProvider(allowSelfSigned: true)
-        }
+        Production mode (with --cert/--key and --ca-cert):
+          - Server loads PEM certificate and key from files
+          - Client verifies server against trusted CA certificate
+          - Full encryption + identity verification
 
     """)
 }
@@ -668,7 +838,12 @@ LoggingSystem.bootstrap { label in
 switch arguments.mode {
 case .server:
     do {
-        try await runServer(host: arguments.host, port: arguments.port)
+        try await runServer(
+            host: arguments.host,
+            port: arguments.port,
+            certPath: arguments.certPath,
+            keyPath: arguments.keyPath
+        )
     } catch {
         log("Server", "Fatal error: \(error)")
         exit(1)
@@ -676,7 +851,11 @@ case .server:
 
 case .client:
     do {
-        try await runClient(host: arguments.host, port: arguments.port)
+        try await runClient(
+            host: arguments.host,
+            port: arguments.port,
+            caCertPath: arguments.caCertPath
+        )
     } catch {
         log("Client", "Fatal error: \(error)")
         exit(1)

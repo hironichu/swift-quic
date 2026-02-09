@@ -26,7 +26,9 @@ This directory contains runnable demo binaries that showcase the **QUIC** and **
 
 - **Swift 6.2+** (swift-tools-version: 6.2)
 - **Linux** or **macOS** (both supported)
-- The examples use `MockTLSProvider` (testing mode, DEBUG builds only) — no certificates required for development
+- The examples use `TLS13Handler` with real TLS 1.3 encryption
+- No certificates required for development (self-signed P-256 key generated at startup)
+- For production mode, provide PEM certificate/key files via command-line arguments
 
 Build the examples:
 
@@ -44,6 +46,8 @@ swift build --target HTTP3Demo
 ---
 
 ## Quick Start
+
+### Development Mode (no certificates needed)
 
 **Terminal 1** — Start the QUIC echo server:
 
@@ -69,6 +73,18 @@ swift run HTTP3Demo server
 swift run HTTP3Demo client
 ```
 
+### Production Mode (with PEM certificates)
+
+```sh
+# QUIC echo server/client with real certificates
+swift run QUICEchoServer server --cert server.pem --key server-key.pem
+swift run QUICEchoServer client --ca-cert ca.pem
+
+# HTTP/3 server/client with real certificates
+swift run HTTP3Demo server --cert server.pem --key server-key.pem
+swift run HTTP3Demo client --ca-cert ca.pem
+```
+
 ---
 
 ## QUICEchoServer — QUIC Protocol Demo
@@ -80,8 +96,11 @@ The server echoes back any data received on bidirectional streams. The client op
 ### Running the Echo Server
 
 ```sh
-# Default: listens on 127.0.0.1:4433
+# Development mode (self-signed, real TLS encryption)
 swift run QUICEchoServer server
+
+# Production mode (with PEM certificate and key)
+swift run QUICEchoServer server --cert server.pem --key server-key.pem
 
 # Custom address
 swift run QUICEchoServer server --host 0.0.0.0 --port 5555
@@ -98,8 +117,11 @@ Output:
 ### Running the Echo Client
 
 ```sh
-# Default: connects to 127.0.0.1:4433
+# Development mode (accepts self-signed certificates)
 swift run QUICEchoServer client
+
+# Production mode (verifies server against trusted CA)
+swift run QUICEchoServer client --ca-cert ca.pem
 
 # Custom address
 swift run QUICEchoServer client --host 192.168.1.10 --port 5555
@@ -124,19 +146,44 @@ Configuration holds all QUIC transport parameters. These are exchanged during th
 
 ```swift
 import QUIC
+import QUICCrypto
 
-// For production with real TLS certificates
+// Production mode: load PEM certificate and key from disk
+let tlsConfig = try TLSConfiguration.server(
+    certificatePath: "/path/to/cert.pem",
+    privateKeyPath: "/path/to/key.pem",
+    alpnProtocols: ["h3"]
+)
 let config = QUICConfiguration.production {
-    MyTLSProvider(certPath: "/path/to/cert.pem", keyPath: "/path/to/key.pem")
+    TLS13Handler(configuration: tlsConfig)
 }
 
-// For development (self-signed certificates OK)
-let config = QUICConfiguration.development {
-    MyTLSProvider(allowSelfSigned: true)
+// Development mode: self-signed certificate (real TLS encryption)
+let signingKey = SigningKey.generateP256()
+var devTLSConfig = TLSConfiguration.server(
+    signingKey: signingKey,
+    certificateChain: [Data([0x30, 0x82, 0x01, 0x00])],
+    alpnProtocols: ["h3"]
+)
+devTLSConfig.verifyPeer = false
+let devConfig = QUICConfiguration.development {
+    TLS13Handler(configuration: devTLSConfig)
 }
 
-// For testing/demos (no real encryption — DEBUG builds only)
-let config = QUICConfiguration.testing()
+// Client with CA verification (production)
+var clientTLS = TLSConfiguration.client(serverName: "localhost", alpnProtocols: ["h3"])
+try clientTLS.loadTrustedCAs(fromPEMFile: "/path/to/ca.pem")
+let clientConfig = QUICConfiguration.production {
+    TLS13Handler(configuration: clientTLS)
+}
+
+// Client accepting self-signed (development)
+var devClientTLS = TLSConfiguration.client(serverName: "localhost", alpnProtocols: ["h3"])
+devClientTLS.verifyPeer = false
+devClientTLS.allowSelfSigned = true
+let devClientConfig = QUICConfiguration.development {
+    TLS13Handler(configuration: devClientTLS)
+}
 ```
 
 Key configuration properties:
@@ -312,8 +359,11 @@ Demonstrates the **HTTP/3 protocol layer** (RFC 9114) built on top of QUIC, incl
 ### Running the HTTP/3 Server
 
 ```sh
-# Default: listens on 127.0.0.1:4443
+# Development mode (self-signed, real TLS encryption)
 swift run HTTP3Demo server
+
+# Production mode (with PEM certificate and key)
+swift run HTTP3Demo server --cert server.pem --key server-key.pem
 
 # Custom address
 swift run HTTP3Demo server --host 0.0.0.0 --port 8443
@@ -335,8 +385,11 @@ Available routes:
 ### Running the HTTP/3 Client
 
 ```sh
-# Default: connects to 127.0.0.1:4443
+# Development mode (accepts self-signed certificates)
 swift run HTTP3Demo client
+
+# Production mode (verifies server against trusted CA)
+swift run HTTP3Demo client --ca-cert ca.pem
 
 # Custom address
 swift run HTTP3Demo client --host 192.168.1.10 --port 8443
@@ -753,38 +806,89 @@ Client                                          Server
 
 ## Security & TLS Configuration
 
-### Testing Mode (This Demo)
+Both demos use `TLS13Handler` — the built-in TLS 1.3 implementation — for **real encryption**. Two modes are supported depending on command-line arguments.
 
-Both examples use `QUICConfiguration.testing()` which provides a `MockTLSProvider`. This is only available in **DEBUG** builds and provides **no real encryption**.
+### Development Mode (Default)
 
-```swift
-// ⚠️ DEBUG builds only — no encryption
-let config = QUICConfiguration.testing()
-```
+When no certificate arguments are provided, the demos run in development mode:
 
-### Development Mode
-
-For development with self-signed certificates:
+- **Server**: Generates a self-signed P-256 key pair at startup
+- **Client**: Accepts self-signed certificates (`allowSelfSigned: true`, `verifyPeer: false`)
+- **Encryption**: Real TLS 1.3 (AES-128-GCM / ChaCha20-Poly1305)
+- **Identity verification**: None (any server certificate is accepted)
 
 ```swift
-let config = QUICConfiguration.development {
-    // Your TLS provider that accepts self-signed certificates
-    MyTLSProvider(allowSelfSigned: true)
+import QUICCrypto
+
+// Server: generate ephemeral self-signed credentials
+let signingKey = SigningKey.generateP256()
+var serverTLS = TLSConfiguration.server(
+    signingKey: signingKey,
+    certificateChain: [Data([0x30, 0x82, 0x01, 0x00])],
+    alpnProtocols: ["h3"]
+)
+serverTLS.verifyPeer = false
+
+let serverConfig = QUICConfiguration.development {
+    TLS13Handler(configuration: serverTLS)
+}
+
+// Client: accept self-signed certificates
+var clientTLS = TLSConfiguration.client(serverName: "localhost", alpnProtocols: ["h3"])
+clientTLS.verifyPeer = false
+clientTLS.allowSelfSigned = true
+
+let clientConfig = QUICConfiguration.development {
+    TLS13Handler(configuration: clientTLS)
 }
 ```
 
-### Production Mode
+### Production Mode (With Certificates)
 
-For production deployments with proper TLS:
+When certificate files are provided via `--cert`/`--key` (server) and `--ca-cert` (client):
+
+- **Server**: Loads PEM certificate and private key from disk
+- **Client**: Verifies the server's certificate against the trusted CA
+- **Encryption**: Real TLS 1.3
+- **Identity verification**: Full X.509 chain validation
+
+```sh
+# Server
+swift run HTTP3Demo server --cert /etc/ssl/certs/fullchain.pem --key /etc/ssl/private/privkey.pem
+
+# Client
+swift run HTTP3Demo client --ca-cert /etc/ssl/certs/ca-bundle.pem
+```
 
 ```swift
-let config = QUICConfiguration.production {
-    // Your TLS 1.3 provider with valid certificates
-    MyTLSProvider(
-        certificatePath: "/etc/ssl/certs/fullchain.pem",
-        privateKeyPath: "/etc/ssl/private/privkey.pem"
-    )
+import QUICCrypto
+
+// Server: load certificate and key from PEM files
+let serverTLS = try TLSConfiguration.server(
+    certificatePath: "/path/to/fullchain.pem",
+    privateKeyPath: "/path/to/privkey.pem",
+    alpnProtocols: ["h3"]
+)
+let serverConfig = QUICConfiguration.production {
+    TLS13Handler(configuration: serverTLS)
 }
+
+// Client: verify server against trusted CA
+var clientTLS = TLSConfiguration.client(serverName: "example.com", alpnProtocols: ["h3"])
+try clientTLS.loadTrustedCAs(fromPEMFile: "/path/to/ca.pem")
+let clientConfig = QUICConfiguration.production {
+    TLS13Handler(configuration: clientTLS)
+}
+```
+
+### Testing Mode (Unit Tests Only)
+
+For unit tests that don't need real encryption, `MockTLSProvider` is available in DEBUG builds:
+
+```swift
+#if DEBUG
+let config = QUICConfiguration.testing()  // ⚠️ No encryption — never use in production
+#endif
 ```
 
 ### Custom TLS Provider
